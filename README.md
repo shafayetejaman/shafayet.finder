@@ -11,12 +11,14 @@ Open the finder from your configured launcher binding. Keys:
 | --- | --- |
 | printable chars | Type to filter |
 | `Esc` | Clear filter, then close |
+| `Ctrl+Backspace` | Delete last query word |
 | `Up` / `Down`, `Ctrl+J` / `Ctrl+K` | Move selection |
 | `PageUp` / `PageDown` | Move by 6 rows |
 | `Home` / `End` | First / last row |
 | `Enter` | Open selection with `xdg-open` |
 | `Shift+Enter` | Copy path |
 | `Alt+Enter` | Reveal in file manager |
+| `Delete` / `Ctrl+D` | Move selection to trash (needs [`trash-cli`](https://github.com/andreafrancia/trash-cli)) |
 
 With an empty query the finder browses a start directory (`~/Downloads`
 by default) instead of searching.

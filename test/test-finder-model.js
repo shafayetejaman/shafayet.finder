@@ -169,6 +169,15 @@ eq(M.isDirPath("/x/"), true, "dir marker")
 eq(M.isDirPath("/x"), false, "file has no marker")
 eq(M.cleanPath("/x///"), "/x", "cleanPath collapses slashes")
 
+// ================= deleteLastWord =================
+
+eq(M.deleteLastWord("foo bar"), "foo ", "kills word, keeps separator")
+eq(M.deleteLastWord("foo bar  "), "foo ", "trailing whitespace collapses with word")
+eq(M.deleteLastWord("foo"), "", "single word empties")
+eq(M.deleteLastWord(""), "", "empty stays empty")
+eq(M.deleteLastWord("--size +5mb invo"), "--size +5mb ", "flag query loses last term")
+eq(M.deleteLastWord("  "), "", "whitespace-only empties")
+
 // ================= parseQuery: inline fd flags =================
 
 function parse(s) { return M.parseQuery(s) }

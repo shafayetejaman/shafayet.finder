@@ -532,6 +532,17 @@ function fileName(path) {
   return parts.length > 0 ? parts[parts.length - 1] : String(path || "")
 }
 
+// Readline-style backward kill for the filter box: strips trailing
+// whitespace, then the word before it — "foo bar  " becomes "foo ".
+function deleteLastWord(text) {
+  var value = String(text || "")
+  var end = value.length
+  while (end > 0 && /\s/.test(value.charAt(end - 1))) end--
+  var start = end
+  while (start > 0 && !/\s/.test(value.charAt(start - 1))) start--
+  return value.substring(0, start)
+}
+
 // Directory rows carry a trailing "/" marker through the pipeline.
 function isDirPath(path) {
   var value = String(path || "")
@@ -656,6 +667,7 @@ if (typeof module !== "undefined") {
     FD_VARIADIC_FLAGS: FD_VARIADIC_FLAGS,
     parseQuery: parseQuery,
     liveFdCommand: liveFdCommand,
+    deleteLastWord: deleteLastWord,
     markDirectories: markDirectories,
     buildSearchCommand: buildSearchCommand,
     buildPreviewCommand: buildPreviewCommand,

@@ -411,6 +411,15 @@ Item {
     Util.execDetached("nautilus --select " + Util.shellQuote(FinderModel.cleanPath(row.path)))
   }
 
+  // Moves the selected row to the freedesktop trash via trash-cli so it can
+  // be restored; closes first, mirroring open/copy/reveal.
+  function trashIndex(index) {
+    var row = activeRow(index)
+    if (!row) return
+    root.close()
+    Util.execDetached("trash-put " + Util.shellQuote(FinderModel.cleanPath(row.path)))
+  }
+
   function cachedPreview(path) {
     var hit = root.previewCache[path] || null
     if (hit) root.touchPreviewCache(path)
@@ -902,6 +911,11 @@ Item {
             if (root.filterText) root.setFilter("")
             else root.close()
             event.accepted = true
+          } else if (event.key === Qt.Key_Backspace && (event.modifiers & Qt.ControlModifier)) {
+            // Intercepted ahead of Util.editsFilter so the shell's plain
+            // backspace handling never eats the modifier variant.
+            root.setFilter(FinderModel.deleteLastWord(root.filterText))
+            event.accepted = true
           } else if (Util.editsFilter(event, root.filterText)) {
             root.setFilter(Util.editedFilter(event, root.filterText))
             event.accepted = true
@@ -934,6 +948,9 @@ Item {
             else if (event.modifiers & Qt.AltModifier) root.revealIndex(root.selectedIndex)
             else if (root.cursorActive) root.activateIndex(root.selectedIndex)
             else if (displayModel.count > 0) root.cursorActive = true
+            event.accepted = true
+          } else if (event.key === Qt.Key_Delete || (event.key === Qt.Key_D && (event.modifiers & Qt.ControlModifier))) {
+            root.trashIndex(root.selectedIndex)
             event.accepted = true
           } else if (event.text && event.text.length === 1 && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127) {
             root.setFilter(root.filterText + event.text)
