@@ -105,7 +105,18 @@ Item {
   }
 
   function close() {
+    // Blank immediately and cancel anything queued: a pending debounce must
+    // not repaint the pane after the overlay is gone, and reopening must
+    // never inherit the previous session's preview.
     root.opened = false
+    searchDebounce.stop()
+    browseDebounce.stop()
+    previewDebounce.stop()
+    root.clearPreview()
+    root.previewCache = ({})
+    root.previewCacheKeys = []
+    root.pdfCache = ({})
+    Util.execDetached("rm -f " + Util.shellQuote(root.pdfPngPath))
   }
 
   function toggle() {
@@ -309,6 +320,7 @@ Item {
       }
       root.previewSerial++
       previewProc.revision = root.previewSerial
+      previewProc.kind = "dir"
       previewProc.currentPath = cleanDir
       previewProc.command = FinderModel.buildDirPreviewCommand(cleanDir)
       previewProc.running = true
@@ -321,7 +333,7 @@ Item {
       if (pdfHit) {
         root.previewIsImage = true
         root.previewSource = root.pdfSourceUrl(pdfHit.ver)
-        root.previewMeta = pdfHit.meta
+        root.previewMeta = ""
         root.previewContent = ""
         return
       }
@@ -481,6 +493,7 @@ Item {
       waitForEnd: true
       onStreamFinished: {
         if (previewProc.revision !== root.previewSerial) return
+        if (!root.opened) return
         var parsed = FinderModel.parsePreviewOutput(text)
         if (previewProc.kind === "pdf") {
           if (parsed.size === -1) {
@@ -489,16 +502,13 @@ Item {
             root.previewContent = ""
             return
           }
-          var label = "PDF"
-          var pages = parseInt(parsed.mtime, 10)
-          if (!isNaN(pages) && pages > 0) label += " · " + pages + (pages === 1 ? " page" : " pages")
-          if (parsed.size > 0) label += " · " + FinderModel.formatBytes(parsed.size)
           root.pdfRenderVersion++
+          // No meta line for PDFs: the page thumbnail owns the whole pane.
           root.previewIsImage = true
           root.previewSource = root.pdfSourceUrl(root.pdfRenderVersion)
-          root.previewMeta = label
+          root.previewMeta = ""
           root.previewContent = ""
-          root.pdfCache[previewProc.currentPath] = { meta: label, ver: root.pdfRenderVersion }
+          root.pdfCache[previewProc.currentPath] = { ver: root.pdfRenderVersion }
           return
         }
         if (parsed.size === -2) {
