@@ -88,6 +88,7 @@ instant cached previews, less background rescanning):
 | `preview_cache_limit` | int | `500` | LRU entries kept in memory across opens (per shell session). |
 | `preview_workers` | int | `3` | Concurrent preview processes; a slow PDF render never blocks text previews. |
 | `debounce_ms` | int | `40` | Delay between keystroke/selection and its search/preview launch. Stale runs are killed by the next keystroke, so low values stay cheap — `25` feels near-instant. |
+| `fd_debounce_ms` | int | `1000` | Debounce for flag-mode queries (`--size +5mb …`). These walk real directory trees, so they wait for typing to settle before launching; every keystroke still kills the previous run eagerly. |
 | `rescan_interval_ms` | int | `60000` | Minimum time between full index rescans. Reopening the finder inside this window reuses the fresh index instead of re-walking every root. `0` rescans on every open. |
 | `pdf_render_scale` | int | `1200` | `-scale-to` value passed to `pdftoppm` for page thumbnails. |
 | `show_hidden` | bool | `false` | Skip dot files by default: hidden entries stay out of the index (fd's default) and out of directory previews; `true` adds `--hidden` to classic scans and shows everything. Note fd still surfaces dotfiles explicitly whitelisted in `.gitignore` (like `!.gitkeep`) regardless of this setting. |
@@ -121,6 +122,38 @@ baseline, which you can reproduce explicitly:
 plus fd's own defaults on top: hidden entries skipped (unless
 `show_hidden`), VCS ignores respected (`--ignore-vcs` to relax), symlinks
 not followed (`--follow` to relax).
+
+### Inline fd flags in the search box
+
+Any whitespace-separated token starting with `-` is treated as an **fd
+flag** and routed to a live `fd` walk over the configured `search_dirs`
+(instead of the fuzzy index). The remaining text is staged:
+
+| Query | fd receives | fzf receives |
+| --- | --- | --- |
+| `invoice` *(no flags)* | — (classic index+fzf path) | `invoice` |
+| `--size +5mb invoice` | flags + pattern `invoice` | — |
+| `--size=+5mb report paid` | attached value + pattern `report` | `paid` |
+| `-e jpg png -- sunset beach` | `-e jpg png` + pattern `sunset` | `beach` |
+| `--size +5mb .` | flags + match-all, scoped to the roots | — |
+| `--size +5mb` *(flags only)* | nothing runs; list clears instantly | — |
+| `-- -weird` | everything after `--` is literal text | `-weird` |
+
+Notes:
+
+- Value flags (`--size/-S`, `--type/-t`, `--max-depth/-d`, `--min-depth`,
+  `--changed-within`, `--changed-before`, `--max-results`) consume the next
+  token. Variadic flags (`--extension/-e`, `--exclude/-E`) swallow every
+  following non-flag token — like fd itself — so end the run with a
+  repeated flag or a bare `--` before typing your text.
+- Unknown flags pass through verbatim; a typo'd flag fails silently and
+  just shows an empty result list.
+- The first text token matches fd-style (smart case); further tokens are
+  fuzzy-ranked by fzf on top of fd's output.
+- Policy ignores (`ignored_dirs`, `ignored_names`) are always enforced, and
+  `--absolute-path` is forced regardless of what you type.
+- Flag mode reads the live disk, so it works even while the index is still
+  scanning. Previews come from the same cache as everywhere else.
 
 ## Behavior notes
 

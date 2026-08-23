@@ -169,6 +169,51 @@ eq(M.isDirPath("/x/"), true, "dir marker")
 eq(M.isDirPath("/x"), false, "file has no marker")
 eq(M.cleanPath("/x///"), "/x", "cleanPath collapses slashes")
 
+// ================= parseQuery: inline fd flags =================
+
+function parse(s) { return M.parseQuery(s) }
+
+eq(parse("invoice"), { args: [], fdPattern: "invoice", fzfQuery: "" }, "plain text -> classic path (no flags)")
+eq(parse("--size +5mb invoice"), { args: ["--size", "+5mb"], fdPattern: "invoice", fzfQuery: "" },
+  "value flag + single text")
+eq(parse("--size=+5mb report paid 2024"), { args: ["--size=+5mb"], fdPattern: "report", fzfQuery: "paid 2024" },
+  "attached value; extra text staged to fzf")
+eq(parse("-e jpg png -- sunset beach"), { args: ["-e", "jpg", "png"], fdPattern: "sunset", fzfQuery: "beach" },
+  "variadic ends at bare --")
+eq(parse("--size +5mb"), { args: ["--size", "+5mb"], fdPattern: "", fzfQuery: "" }, "flags-only -> no run")
+eq(parse("-- -weird x"), { args: [], fdPattern: "-weird", fzfQuery: "x" }, "bare -- makes everything literal")
+eq(parse("--hidden foo bar baz"), { args: ["--hidden"], fdPattern: "foo", fzfQuery: "bar baz" },
+  "unknown flag passes through as boolean")
+eq(parse("-S 5mb --type d report rest"), { args: ["-S", "5mb", "--type", "d"], fdPattern: "report", fzfQuery: "rest" },
+  "mixed short/long value flags")
+eq(parse("--changed-within 1d ."), { args: ["--changed-within", "1d"], fdPattern: ".", fzfQuery: "" },
+  "match-all wildcard token")
+eq(parse("-"), { args: [], fdPattern: "-", fzfQuery: "" }, "lone dash is text, not a flag")
+
+// ================= liveFdCommand =================
+
+var liveCfg = M.resolveSettings({ search_dirs: ["/r1", "/r2"], ignored_dirs: ["/r2/deep/x"] }, HOME)
+var lf = M.liveFdCommand(liveCfg, parse("--size +5mb big rest"), 50)[2]
+eq(fdInvocationCount(lf), 1, "live fd is ONE invocation")
+ok(lf.indexOf("'--size' '+5mb'") !== -1, "user flags verbatim and quoted")
+ok(lf.indexOf("'--absolute-path'") !== -1, "absolute path forced")
+ok(lf.indexOf("'--exclude' '**/deep/x'") !== -1, "policy excludes enforced in flag mode")
+ok(lf.indexOf("'big' \"${__p[@]}\"") !== -1, "pattern quoted before guarded roots")
+ok(lf.indexOf("| fzf --filter 'rest' --scheme=path") !== -1, "second text stage goes through fzf")
+ok(lf.trim().endsWith("| head -n 50"), "live results capped")
+ok(/wait "\$__p"/.test(lf), "live leaf relay-wrapped")
+
+lf = M.liveFdCommand(liveCfg, parse("-e txt ."), 50)[2]
+ok(lf.indexOf("| fzf ") === -1, "no fzf stage without a second text token")
+ok(lf.indexOf("'.' \"${__p[@]}\"") !== -1, "match-all pattern scoped to roots")
+
+// defensive: no roots / empty args -> valid no-op
+eq(M.liveFdCommand(M.resolveSettings({ ignored_dirs: ["$HOME"] }, HOME), parse("--size +5mb x"), 50),
+  ["bash", "-c", ""], "no roots -> no-op")
+eq(M.liveFdCommand(liveCfg, { args: [], fdPattern: "x", fzfQuery: "" }, 50), ["bash", "-c", ""], "no flags -> no-op")
+ok(M.liveFdCommand(liveCfg, parse("--size +5mb"), 50)[2].indexOf("'.' \"${__p[@]}\"") !== -1,
+  "empty pattern falls back to match-all")
+
 // ================= integration: real execution =================
 // Executes generated scripts against a throwaway tree to prove the bash
 // itself behaves: dead-root isolation, policy excludes, caps, dirs-first.
@@ -204,6 +249,43 @@ eq(M.cleanPath("/x///"), "/x", "cleanPath collapses slashes")
   cfg = M.resolveSettings({ browse_dir: live1 }, HOME)
   var browsed = run(M.browseCommand(cfg)).split("\n").filter(function (l) { return l.length > 1 && l.charAt(0) === "/" })
   eq(browsed, [path.join(live1, "sub") + "/", path.join(live1, "a.txt")], "integration: browse dirs-first depth-1")
+
+  fs.rmSync(tmp, { recursive: true, force: true })
+})
+
+// Live flag-mode integration: proves the generated fd/fzf pipeline actually
+// filters on size, extensions, staged text, and fails silent-and-empty.
+;(function integrationFlagMode() {
+  // Fixed letter-safe base: fzf matches whole absolute paths, so random
+  // temp names could supply the very characters the staged query filters on.
+  var tmp = "/tmp/fdr-t-" + process.pid
+  var root = path.join(tmp, "tree")
+  fs.rmSync(tmp, { recursive: true, force: true })
+  fs.mkdirSync(path.join(root, "sub"), { recursive: true })
+  fs.writeFileSync(path.join(root, "big.txt"), Buffer.alloc(2048, "a"))
+  fs.writeFileSync(path.join(root, "small.txt"), Buffer.alloc(200, "s"))
+  fs.writeFileSync(path.join(root, "pic.jpg"), Buffer.alloc(2048, "j"))
+  fs.writeFileSync(path.join(root, "sub", "deep.txt"), Buffer.alloc(3072, "d"))
+
+  var cfg = M.resolveSettings({ search_dirs: [root] }, HOME)
+  function runLive(query) {
+    var cmd = M.liveFdCommand(cfg, parse(query), 50)
+    var out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+    return out.split("\n").filter(function (l) { return l.length > 1 && l.charAt(0) === "/" })
+  }
+
+  // size filter + first text token as fd pattern
+  eq(runLive("--size +1kb big"), [path.join(root, "big.txt")], "live: size + pattern")
+  // match-all wildcard scoped to roots
+  eq(runLive("--type f --size +1kb .").sort(),
+    [path.join(root, "big.txt"), path.join(root, "pic.jpg"), path.join(root, "sub", "deep.txt")].sort(),
+    "live: match-all over roots")
+  // extension via variadic ended by bare --, then single text token
+  eq(runLive("-e jpg -- pic"), [path.join(root, "pic.jpg")], "live: extension filter")
+  // staged filtering: fd narrows, fzf ranks the remainder
+  eq(runLive("--type f . big"), [path.join(root, "big.txt")], "live: fzf stage filters fd output")
+  // unknown/broken flag -> silent empty result
+  eq(runLive("--frobnicate x"), [], "live: broken flag yields silence")
 
   fs.rmSync(tmp, { recursive: true, force: true })
 })()

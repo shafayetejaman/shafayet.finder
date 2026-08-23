@@ -9,6 +9,7 @@ var previewByteLimit = 65536
 var previewCacheLimit = 500
 var previewWorkers = 3
 var debounceMs = 40
+var fdDebounceMs = 1000
 var rescanIntervalMs = 60000
 var pdfRenderScale = 1200
 
@@ -131,6 +132,7 @@ function resolveSettings(settings, home) {
     previewCacheLimit: positiveInt(settings, "preview_cache_limit", previewCacheLimit),
     previewWorkers: positiveInt(settings, "preview_workers", previewWorkers),
     debounceMs: nonNegativeInt(settings, "debounce_ms", debounceMs),
+    fdDebounceMs: nonNegativeInt(settings, "fd_debounce_ms", fdDebounceMs),
     rescanIntervalMs: nonNegativeInt(settings, "rescan_interval_ms", rescanIntervalMs),
     pdfRenderScale: positiveInt(settings, "pdf_render_scale", pdfRenderScale),
     showHidden: boolSetting(settings, "show_hidden", false),
@@ -378,6 +380,109 @@ function buildSearchCommand(listPath, query, displayLimit) {
   ]
 }
 
+// ================= inline fd flags in the search box =================
+
+// Flags that consume exactly one following value token.
+var FD_VALUE_FLAGS = {
+  "--size": 1, "-S": 1,
+  "--type": 1, "-t": 1,
+  "--max-depth": 1, "-d": 1,
+  "--min-depth": 1,
+  "--exact-depth": 1,
+  "--changed-within": 1,
+  "--changed-before": 1,
+  "--changed-after": 1,
+  "--max-results": 1,
+}
+
+// Flags that swallow every following non-flag token, like fd itself. Use a
+// repeated flag or a bare "--" to end the run and start the text portion.
+var FD_VARIADIC_FLAGS = {
+  "--extension": 1, "-e": 1,
+  "--exclude": 1, "-E": 1,
+}
+
+function flagLike(token) {
+  return token.length > 1 && token.charAt(0) === "-"
+}
+
+// Splits a raw query into fd flags and staged text:
+//   "invoice"                    -> { args: [], fdPattern: "", fzfQuery: "" }  (classic path)
+//   "--size 5mb+ invoice"        -> args [--size 5mb+], text "invoice"
+//   "--size=5mb+ report paid"    -> attached values work; "paid" goes to fzf
+//   "-e jpg png -- sunset beach" -> variadic ends at "--"; text after it
+//   "-- -weird"                  -> everything after "--" is literal text
+// First text token becomes the fd pattern; the rest joins into the fzf query.
+function parseQuery(input) {
+  var tokens = String(input || "").trim().split(/\s+/).filter(function (t) { return t })
+  var args = []
+  var text = []
+  var i = 0
+  var parsingFlags = true
+  while (i < tokens.length) {
+    var token = tokens[i]
+    if (!parsingFlags) {
+      text.push(token)
+      i++
+      continue
+    }
+    if (token === "--") {
+      parsingFlags = false
+      i++
+      continue
+    }
+    if (!flagLike(token)) {
+      text.push(token)
+      i++
+      continue
+    }
+    // A flag token: push verbatim and consume its value(s), if any.
+    args.push(token)
+    i++
+    var isValueFlag = FD_VALUE_FLAGS.hasOwnProperty(token)
+    if (!isValueFlag && !FD_VARIADIC_FLAGS.hasOwnProperty(token)) continue
+    if (token.indexOf("=") !== -1) continue // --flag=value carries its own
+    while (i < tokens.length && tokens[i] !== "--" && !flagLike(tokens[i])) {
+      args.push(tokens[i])
+      i++
+      if (isValueFlag) break
+    }
+  }
+  return {
+    args: args,
+    fdPattern: text.length > 0 ? text[0] : "",
+    fzfQuery: text.slice(1).join(" ")
+  }
+}
+
+// Live fd search over all roots with user-supplied flags: one relay-wrapped,
+// guarded walk exactly like the index scan, then an optional fzf stage for
+// the second-and-further text tokens. Errors stay silent — a bad flag just
+// yields no lines.
+function liveFdCommand(cfg, parsed, displayLimit) {
+  if (displayLimit === undefined) displayLimit = maxDisplayRows
+  if (!cfg || !cfg.searchDirs || cfg.searchDirs.length === 0 ||
+      !parsed || !parsed.args || parsed.args.length === 0) {
+    return ["bash", "-c", ""]
+  }
+  var absArgs = parsed.args.slice()
+  if (absArgs.indexOf("--absolute-path") === -1 && absArgs.indexOf("-a") === -1) absArgs.push("--absolute-path")
+  if (cfg.showHidden && absArgs.indexOf("--hidden") === -1 && absArgs.indexOf("-H") === -1 && absArgs.indexOf("-u") === -1) {
+    absArgs.push("--hidden")
+  }
+  var argStr = shellJoin(absArgs).join(" ")
+  var ex = combinedExcludeSegment(cfg)
+  var script = "( { " + guardedRootsSnippet(cfg.searchDirs) + " ; "
+    + termRelay("fd " + argStr + (ex ? " " + ex : "")
+      + " " + shellQuote(parsed.fdPattern || ".") + " \"${__p[@]}\" 2>/dev/null")
+    + " ; } 2>/dev/null )"
+  if (parsed.fzfQuery) {
+    script += " | fzf --filter " + shellQuote(parsed.fzfQuery) + " --scheme=path 2>/dev/null"
+  }
+  script += " | head -n " + displayLimit
+  return ["bash", "-c", script]
+}
+
 function buildPreviewCommand(path, byteLimit) {
   if (byteLimit === undefined) byteLimit = previewByteLimit
   var quoted = shellQuote(path)
@@ -546,6 +651,11 @@ if (typeof module !== "undefined") {
     expandPaths: expandPaths,
     searchDirs: searchDirs,
     shellQuote: shellQuote,
+    fdDebounceMs: fdDebounceMs,
+    FD_VALUE_FLAGS: FD_VALUE_FLAGS,
+    FD_VARIADIC_FLAGS: FD_VARIADIC_FLAGS,
+    parseQuery: parseQuery,
+    liveFdCommand: liveFdCommand,
     markDirectories: markDirectories,
     buildSearchCommand: buildSearchCommand,
     buildPreviewCommand: buildPreviewCommand,

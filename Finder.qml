@@ -22,6 +22,7 @@ Item {
   property int scanSerial: 0
   property int searchSerial: 0
   property int browseSerial: 0
+  property int fdSerial: 0
   property bool scanQueued: false
   property double lastScanFinishedAt: 0
   property bool previewIsImage: false
@@ -118,6 +119,7 @@ Item {
     root.opened = false
     searchDebounce.stop()
     browseDebounce.stop()
+    fdDebounce.stop()
     previewDebounce.stop()
     root.cancelPendingWork()
     root.clearPreview()
@@ -191,12 +193,32 @@ Item {
   function requestSearch() {
     if (!root.opened) return
 
-    root.searchSerial++
     var query = root.filterText.trim()
     if (!query) {
       root.startBrowse()
       return
     }
+
+    // Inline fd flags route to a live walk over the roots themselves — the
+    // persisted index is irrelevant there. A flags-only query (no pattern)
+    // runs nothing and clears instantly.
+    var parsed = FinderModel.parseQuery(query)
+    if (parsed.args.length > 0) {
+      if (!parsed.fdPattern) {
+        root.searchResults = []
+        root.rebuildDisplay()
+        return
+      }
+      root.searchSerial++
+      root.fdSerial++
+      fdProc.revision = root.fdSerial
+      fdProc.queuedStart = true
+      if (!fdProc.running) startFdSearch()
+      else fdProc.running = false
+      return
+    }
+
+    root.searchSerial++
     // Searching is allowed even while a rescan is in flight: the persisted
     // list from the previous scan stays valid until the new one lands.
     if (root.fileListCount === 0) {
@@ -216,10 +238,22 @@ Item {
     if (!searchProc.queuedStart) return
     searchProc.queuedStart = false
     var query = root.filterText.trim()
-    if (!query || !root.opened || root.fileListCount === 0) return
+    if (!query || !root.opened || FinderModel.parseQuery(query).args.length > 0 || root.fileListCount === 0) return
     searchProc.revision = root.searchSerial
     searchProc.command = FinderModel.buildSearchCommand(root.listPath, query, root.cfg.maxDisplayRows)
     searchProc.running = true
+  }
+
+  // Same teardown-safe queueing as startSearch, but re-parses so a parked
+  // job only launches when its input still carries fd flags with a pattern.
+  function startFdSearch() {
+    if (!fdProc.queuedStart) return
+    fdProc.queuedStart = false
+    var parsed = FinderModel.parseQuery(root.filterText.trim())
+    if (!root.opened || parsed.args.length === 0 || !parsed.fdPattern) return
+    fdProc.revision = root.fdSerial
+    fdProc.command = FinderModel.liveFdCommand(root.cfg, parsed, root.cfg.maxDisplayRows)
+    fdProc.running = true
   }
 
   function rebuildDisplay() {
@@ -278,6 +312,20 @@ Item {
     // Every keystroke makes every in-flight search/browse/preview stale:
     // stop them now instead of letting them run to an invisible finish.
     root.cancelPendingWork()
+    searchDebounce.stop()
+    fdDebounce.stop()
+    var parsed = FinderModel.parseQuery(nextFilter)
+    if (parsed.args.length > 0) {
+      if (!parsed.fdPattern) {
+        // Flags-only: nothing to run, clear immediately for feedback.
+        root.searchResults = []
+        root.rebuildDisplay()
+        return
+      }
+      // Flag mode walks real trees: a slower debounce keeps the churn down.
+      fdDebounce.restart()
+      return
+    }
     searchDebounce.restart()
   }
 
@@ -287,10 +335,29 @@ Item {
     root.searchSerial++
     searchProc.revision = root.searchSerial
     if (searchProc.running) searchProc.running = false
+    else searchProc.queuedStart = false
     root.browseSerial++
     browseProc.revision = root.browseSerial
     if (browseProc.running) browseProc.running = false
+    else browseDebounce.stop()
+    root.fdSerial++
+    fdProc.revision = root.fdSerial
+    if (fdProc.running) fdProc.running = false
+    else fdProc.queuedStart = false
     root.killPreviewWorkers()
+  }
+
+  // Shared tail for every result producer: absolute-path lines only, capped,
+  // straight into the display. Directories keep their trailing "/" marker.
+  function applyPathLines(raw) {
+    var rows = []
+    var lines = String(raw || "").split("\n")
+    for (var i = 0; i < lines.length && rows.length < root.cfg.maxDisplayRows; i++) {
+      var line = lines[i]
+      if (line.length > 1 && line.charAt(0) === "/") rows.push(line)
+    }
+    root.searchResults = rows
+    root.rebuildDisplay()
   }
 
   function killPreviewWorkers() {
@@ -495,6 +562,14 @@ Item {
     onTriggered: root.requestSearch()
   }
 
+  // Flag mode walks real directory trees, so it debounces slower than the
+  // plain fzf path — every keystroke still kills the previous run eagerly.
+  Timer {
+    id: fdDebounce
+    interval: root.cfg.fdDebounceMs
+    onTriggered: root.requestSearch()
+  }
+
   Timer {
     id: browseDebounce
     interval: root.cfg.debounceMs
@@ -508,14 +583,7 @@ Item {
       waitForEnd: true
       onStreamFinished: {
         if (browseProc.revision !== root.browseSerial) return
-        var rows = []
-        var lines = String(text || "").split("\n")
-        for (var i = 0; i < lines.length; i++) {
-          var line = lines[i]
-          if (line.length > 1 && line.indexOf("/") === 0) rows.push(line)
-        }
-        root.searchResults = rows
-        root.rebuildDisplay()
+        root.applyPathLines(text)
       }
     }
   }
@@ -529,14 +597,23 @@ Item {
       waitForEnd: true
       onStreamFinished: {
         if (searchProc.revision !== root.searchSerial) return
-        var rows = []
-        var lines = String(text || "").split("\n")
-        for (var i = 0; i < lines.length && rows.length < root.cfg.maxDisplayRows; i++) {
-          var line = lines[i]
-          if (line.length > 1 && line.indexOf("/") === 0) rows.push(line)
-        }
-        root.searchResults = rows
-        root.rebuildDisplay()
+        root.applyPathLines(text)
+      }
+    }
+  }
+
+  // Live fd-flag search: same queue-on-teardown lifecycle as searchProc,
+  // but the walk runs against the roots themselves instead of the index.
+  Process {
+    id: fdProc
+    property int revision: -1
+    property bool queuedStart: false
+    onExited: root.startFdSearch()
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (fdProc.revision !== root.fdSerial) return
+        root.applyPathLines(text)
       }
     }
   }
