@@ -108,11 +108,13 @@ function resolveBrowseDir(settings, home) {
 // source of truth for every tunable the QML side and command builders need;
 // safe to call with {} or null.
 function resolveSettings(settings, home) {
-  var names = builtinIgnoreNames.concat(ignoredNames(settings))
   var rawFd = asStringArray(setting(settings, "fd_flags", []))
   return {
     searchDirs: searchDirs(settings, home),
-    ignorePatterns: names.concat(expandPaths(asStringArray(setting(settings, "ignored_dirs", [])), home)),
+    // Names prune as unanchored excludes (any depth); dirs as anchored
+    // per-root excludes (see fdExcludeArgs).
+    ignoreNames: builtinIgnoreNames.concat(ignoredNames(settings)),
+    ignoredDirs: expandPaths(asStringArray(setting(settings, "ignored_dirs", [])), home),
     maxScanResults: positiveInt(settings, "max_scan_results", maxScanResults),
     maxDisplayRows: positiveInt(settings, "max_display_rows", maxDisplayRows),
     maxBrowseRows: positiveInt(settings, "max_browse_rows", maxBrowseRows),
@@ -130,44 +132,65 @@ function resolveSettings(settings, home) {
   }
 }
 
-// Entry points used by QML: dispatch on whether fd_flags overrides.
+// Native fd excludes for one search root: names match any component at any
+// depth; configured dirs translate to gitignore-style anchored globs so
+// "/home/x/.cache" only ever prunes that exact subtree — a same-named
+// directory elsewhere in the tree stays indexed. Pairs outside the root are
+// skipped (fd would never descend there anyway). Excluding before traversal
+// lets fd skip whole subtrees instead of emitting lines for grep to discard.
+function fdExcludeArgs(root, ignoreNames, ignoredDirs) {
+  var args = []
+  var i
+  for (i = 0; i < ignoreNames.length; i++) {
+    if (ignoreNames[i]) args.push("-E", String(ignoreNames[i]))
+  }
+  for (i = 0; i < ignoredDirs.length; i++) {
+    var dir = String(ignoredDirs[i] || "")
+    if (!dir) continue
+    if (dir === root || dir.indexOf(root + "/") === 0) {
+      var rel = dir.slice(root.length).replace(/^\/+/, "")
+      args.push("-E", "/" + rel)
+    }
+  }
+  return args
+}
+
+function quotedExcludeSegment(root, cfg) {
+  return shellJoin(fdExcludeArgs(root, cfg.ignoreNames, cfg.ignoredDirs)).join(" ")
+}
+
+// Entry points used by QML: dispatch on whether fd_flags overrides. Policy
+// excludes (ignored_dirs/ignored_names) are enforced in BOTH modes by being
+// part of every fd invocation — user flags stay literal for everything else.
 function scanCommand(cfg) {
   if (cfg && cfg.fdOverrideArgs) {
     var args = shellJoin(cfg.fdOverrideArgs)
     var blocks = []
     for (var i = 0; i < cfg.searchDirs.length; i++) {
-      var quotedDir = shellQuote(cfg.searchDirs[i])
-      var fdCmd = "fd " + args.join(" ") + " . " + quotedDir
+      var root = cfg.searchDirs[i]
+      var ex = quotedExcludeSegment(root, cfg)
+      var fdCmd = "fd " + args.join(" ") + (ex ? " " + ex : "") + " . " + shellQuote(root)
       blocks.push("( " + termRelay(fdCmd + " 2>/dev/null") + " | " + fdClassifySnippet(false)
         + " ; printf '\\n" + scanBlockMarker + "\\n' ) 2>/dev/null")
     }
-    var script = "( " + blocks.join(" ; ") + " ) 2>/dev/null"
-    var clean = []
-    for (var p = 0; p < cfg.ignorePatterns.length; p++) {
-      if (cfg.ignorePatterns[p]) clean.push(cfg.ignorePatterns[p])
-    }
-    if (clean.length > 0) {
-      var ig = []
-      for (var e = 0; e < clean.length; e++) ig.push("-e " + shellQuote(clean[e]))
-      script += " | grep -vF " + ig.join(" ")
-    }
-    script += " | head -n " + cfg.maxScanResults
-    return ["bash", "-c", script]
+    return ["bash", "-c",
+      "( " + blocks.join(" ; ") + " ) 2>/dev/null | head -n " + cfg.maxScanResults]
   }
-  return buildScanCommand(cfg.searchDirs, cfg.ignorePatterns, cfg.maxScanResults, cfg.fdFlags, cfg.showHidden)
+  return scanCommandClassic(cfg)
 }
 
 function browseCommand(cfg) {
   if (cfg && cfg.fdOverrideArgs) {
     var argStr = shellJoin(cfg.fdOverrideArgs).join(" ")
     var quoted = shellQuote(cfg.browseDir)
-    var fdCmd = "fd " + argStr + " --min-depth 1 --max-depth 1 . " + quoted
-    var script = "{ [ -d " + quoted + " ] || exit 0 ; } ; "
+    var ex = quotedExcludeSegment(cfg.browseDir, cfg)
+    var fdCmd = "fd " + argStr + (ex ? " " + ex : "") + " --min-depth 1 --max-depth 1 . " + quoted
+    return ["bash", "-c",
+      "{ [ -d " + quoted + " ] || exit 0 ; } ; "
       + "( " + termRelay(fdCmd + " 2>/dev/null") + " | " + fdClassifySnippet(true) + " ) 2>/dev/null"
-      + " | head -n " + cfg.maxBrowseRows
-    return ["bash", "-c", script]
+      + " | head -n " + cfg.maxBrowseRows]
   }
-  return buildBrowseCommand(cfg.browseDir, cfg.maxBrowseRows, cfg.fdFlags, cfg.showHidden)
+  return browseCommandClassic(cfg)
 }
 
 function setting(settings, name, fallback) {
@@ -210,11 +233,6 @@ function searchDirs(settings, home) {
   return expanded.length > 0 ? expanded : [home]
 }
 
-function ignorePatterns(settings, home) {
-  var configured = expandPaths(asStringArray(setting(settings, "ignored_dirs", [])), home)
-  return builtinIgnoreNames.concat(configured)
-}
-
 function shellQuote(value) {
   return "'" + String(value || "").replace(/'/g, "'\\''") + "'"
 }
@@ -235,33 +253,25 @@ var scanBlockMarker = "@@END@@"
 
 // One fd pass per search dir for files and another for directories so a
 // missing directory cannot sink the others. Each pass is a relay-wrapped
-// leaf; the framed chunks are re-joined by markDirectories() per directory
-// with the trailing "/" type marker applied in JS, where it survives fzf
-// filtering like the old sed did.
-function buildScanCommand(dirs, patterns, scanLimit, fdFlags, showHidden) {
-  if (scanLimit === undefined) scanLimit = maxScanResults
-  var flags = fdFlagSegment(fdFlags)
-  if (showHidden) flags += "--hidden "
+// leaf carrying this root's native excludes; the framed chunks are
+// re-joined by markDirectories() per directory with the trailing "/"
+// type marker applied in JS, where it survives fzf filtering.
+function scanCommandClassic(cfg) {
   var parts = []
-  for (var i = 0; i < dirs.length; i++) {
+  for (var i = 0; i < cfg.searchDirs.length; i++) {
+    var root = cfg.searchDirs[i]
+    var flags = fdFlagSegment(cfg.fdFlags)
+    if (cfg.showHidden) flags += "--hidden "
+    var ex = quotedExcludeSegment(root, cfg)
+    if (ex) flags += ex + " "
     parts.push("( "
-      + termRelay("fd " + flags + "--type file --absolute-path . " + shellQuote(dirs[i]))
+      + termRelay("fd " + flags + "--type file --absolute-path . " + shellQuote(root))
       + " ; printf '\\n" + scanSectionMarker + "\\n' ; "
-      + termRelay("fd " + flags + "--type directory --absolute-path . " + shellQuote(dirs[i]))
+      + termRelay("fd " + flags + "--type directory --absolute-path . " + shellQuote(root))
       + " ; printf '\\n" + scanBlockMarker + "\\n' ) 2>/dev/null")
   }
-  var script = "( " + parts.join(" ; ") + " ) 2>/dev/null"
-  var clean = []
-  for (var p = 0; p < patterns.length; p++) {
-    if (patterns[p]) clean.push(patterns[p])
-  }
-  if (clean.length > 0) {
-    var args = []
-    for (var e = 0; e < clean.length; e++) args.push("-e " + shellQuote(clean[e]))
-    script += " | grep -vF " + args.join(" ")
-  }
-  script += " | head -n " + scanLimit
-  return ["bash", "-c", script]
+  return ["bash", "-c",
+    "( " + parts.join(" ; ") + " ) 2>/dev/null | head -n " + cfg.maxScanResults]
 }
 
 // Re-joins framed scan blocks: each "files @@DIRS@@ dirs @@END@@" becomes
@@ -293,15 +303,17 @@ function markDirectories(raw) {
 
 // Non-recursive snapshot of one directory, directories first. Shown when the
 // query is empty so the finder opens as a browser of ~/Downloads.
-function buildBrowseCommand(dir, browseLimit, fdFlags, showHidden) {
-  if (browseLimit === undefined) browseLimit = maxBrowseRows
-  var flags = fdFlagSegment(fdFlags)
-  if (showHidden) flags += "--hidden "
+function browseCommandClassic(cfg) {
+  var dir = cfg.browseDir
+  var flags = fdFlagSegment(cfg.fdFlags)
+  if (cfg.showHidden) flags += "--hidden "
+  var ex = quotedExcludeSegment(dir, cfg)
+  if (ex) flags += ex + " "
   return ["bash", "-c",
     "{ [ -d " + shellQuote(dir) + " ] || exit 0 ; } ; "
     + "( fd " + flags + "--type directory --absolute-path --min-depth 1 --max-depth 1 . " + shellQuote(dir) + " 2>/dev/null | sed 's|[^/]$|&/|'"
     + " ; fd " + flags + "--type file --absolute-path --min-depth 1 --max-depth 1 . " + shellQuote(dir) + " 2>/dev/null )"
-    + " | head -n " + browseLimit
+    + " | head -n " + cfg.maxBrowseRows
   ]
 }
 
@@ -461,6 +473,8 @@ if (typeof module !== "undefined") {
     fdOverrideArgs: fdOverrideArgs,
     fdClassifySnippet: fdClassifySnippet,
     shellJoin: shellJoin,
+    fdExcludeArgs: fdExcludeArgs,
+    quotedExcludeSegment: quotedExcludeSegment,
     resolveBrowseDir: resolveBrowseDir,
     resolveSettings: resolveSettings,
     scanCommand: scanCommand,
@@ -469,11 +483,8 @@ if (typeof module !== "undefined") {
     asStringArray: asStringArray,
     expandPaths: expandPaths,
     searchDirs: searchDirs,
-    ignorePatterns: ignorePatterns,
     shellQuote: shellQuote,
-    buildScanCommand: buildScanCommand,
     markDirectories: markDirectories,
-    buildBrowseCommand: buildBrowseCommand,
     buildSearchCommand: buildSearchCommand,
     buildPreviewCommand: buildPreviewCommand,
     buildDirPreviewCommand: buildDirPreviewCommand,

@@ -64,8 +64,8 @@ hot-reload when you save `shell.json`.
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `search_dirs` | string[] | `["$HOME"]` | Roots scanned into the search index. `$HOME` and leading `~` expand. |
-| `ignored_dirs` | string[] | `[]` | Paths whose subtree never enters the index. |
-| `ignored_names` | string[] | `[]` | Extra directory names to skip, merged with the built-ins (`node_modules`, `__pycache__`). |
+| `ignored_dirs` | string[] | `[]` | Paths whose subtree never enters the index. Passed to fd as anchored native excludes, so ignored subtrees are never traversed; a same-named directory elsewhere in the tree is unaffected. |
+| `ignored_names` | string[] | `[]` | Directory/file names to skip anywhere in the tree, merged with the built-ins (`node_modules`, `__pycache__`). Native fd excludes. |
 | `browse_dir` | string | `$HOME/Downloads` | Directory listed while the query is empty. |
 | `max_scan_results` | int | `100000` | Cap on indexed paths per scan. |
 | `max_display_rows` | int | `50` | Max rows shown for a query. |
@@ -90,6 +90,9 @@ set** the finder would otherwise use — your flags are passed to a single
 
 - The finder auto-appends `--absolute-path` if you omit it (the index
   stores absolute paths; results would be unusable without it).
+- Configured ignores (`ignored_dirs`, `ignored_names`) are always enforced:
+  their native `-E` excludes are appended after your flags, so shell.json
+  policy cannot be defeated by override flags.
 - Flags must make `fd` print paths — avoid `--exec`, `-x`, or quiet modes.
 - Search roots/patterns stay builder-owned; don't pass positional paths.
 
