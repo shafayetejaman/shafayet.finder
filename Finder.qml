@@ -62,13 +62,13 @@ Item {
   property color selectedText: Color.menu.selectedText
   readonly property int cornerRadius: Style.cornerRadius
   property string fontFamily: Style.font.menuFamily
-  property int contentFontSize: Style.font.title
+  property int contentFontSize: root.cfg.contentFontSize
   property int contentMargin: Style.spacing.panelPadding
-  property int headerHeight: Math.max(Style.space(34), Style.font.title + Style.spacing.controlPaddingY * 2)
+  property int headerHeight: Math.max(Style.space(34), root.contentFontSize + Style.spacing.controlPaddingY * 2)
   property int contentSpacing: Style.spacing.md
   property int cardWidth: Math.min(Style.space(875), panel.width - Style.gapsOut * 2)
   property int cardHeight: Math.min(Style.space(550), panel.height - Style.gapsOut * 2)
-  property int rowHeight: Math.max(Style.space(58), root.contentFontSize + Style.font.caption + Style.spacing.rowPaddingX * 2)
+  property int rowHeight: Math.max(Style.space(58), root.contentFontSize + root.cfg.contentCaption + Style.spacing.rowPaddingX * 2)
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string pluginId: manifest && manifest.id ? String(manifest.id) : "shafayet.finder"
@@ -982,7 +982,7 @@ Item {
             color: root.foreground
             opacity: root.filterText ? 1 : 0.58
             font.family: root.fontFamily
-            font.pixelSize: Style.font.heading
+            font.pixelSize: root.cfg.contentHeading
             elide: Text.ElideRight
           }
 
@@ -995,7 +995,7 @@ Item {
             color: root.foreground
             opacity: 0.5
             font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
+            font.pixelSize: root.cfg.contentCaption
           }
         }
 
@@ -1058,7 +1058,7 @@ Item {
                       color: parent.parent.hasCursor ? root.selectedText : root.foreground
                       opacity: 0.55
                       font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
+font.pixelSize: root.cfg.contentCaption
                       elide: Text.ElideMiddle
                     }
                   }
@@ -1105,7 +1105,7 @@ Item {
                 color: root.foreground
                 opacity: 0.55
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
+                font.pixelSize: root.cfg.contentCaption
                 elide: Text.ElideRight
               }
 
@@ -1136,7 +1136,7 @@ Item {
                   color: root.selectedText
                   opacity: 0.6
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.displayLarge * 2
+                  font.pixelSize: root.cfg.contentDisplayLarge * 2
                   horizontalAlignment: Text.AlignHCenter
                   width: parent.width
                 }
@@ -1146,7 +1146,7 @@ Item {
                   color: root.foreground
                   opacity: 0.55
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                  font.pixelSize: root.cfg.contentCaption
                   horizontalAlignment: Text.AlignHCenter
                   width: parent.width
                 }
@@ -1176,7 +1176,7 @@ Item {
               color: root.selectedText
               opacity: 0.8
               font.family: root.fontFamily
-              font.pixelSize: Style.font.displayLarge
+              font.pixelSize: root.cfg.contentDisplayLarge
               horizontalAlignment: Text.AlignHCenter
               width: parent.width
             }

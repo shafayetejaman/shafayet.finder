@@ -12,6 +12,10 @@ var debounceMs = 40
 var fdDebounceMs = 1000
 var rescanIntervalMs = 60000
 var pdfRenderScale = 1200
+var fontTitle = 13
+var fontCaption = 12
+var fontHeading = 16
+var fontDisplayLarge = 18
 
 // Non-hidden junk directories fd would otherwise happily index. Hidden dirs
 // never reach the list because the scan omits --hidden; these are the ones
@@ -136,6 +140,10 @@ function resolveSettings(settings, home) {
     rescanIntervalMs: nonNegativeInt(settings, "rescan_interval_ms", rescanIntervalMs),
     pdfRenderScale: positiveInt(settings, "pdf_render_scale", pdfRenderScale),
     showHidden: boolSetting(settings, "show_hidden", false),
+    contentFontSize: positiveInt(settings, "content_font_size", fontTitle),
+    contentCaption: positiveInt(settings, "content_caption", fontCaption),
+    contentHeading: positiveInt(settings, "content_heading", fontHeading),
+    contentDisplayLarge: positiveInt(settings, "content_display_large", fontDisplayLarge),
     // Classic mode: user flags add to the builder-owned type selection.
     fdFlags: sanitizedFdFlags(rawFd),
     // Override mode: non-empty fd_flags replaces the whole flag set verbatim.
