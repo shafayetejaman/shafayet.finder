@@ -181,6 +181,29 @@ function isImagePath(path) {
   return /\.(png|jpe?g|webp|gif|bmp|tiff?)$/i.test(String(path || ""))
 }
 
+function isPdfPath(path) {
+  return /\.pdf$/i.test(String(path || ""))
+}
+
+function isVideoPath(path) {
+  return /\.(mp4|mkv|webm|mov|avi|m4v|mpg|mpeg|wmv|flv|m2ts|ts|3gp|ogv)$/i.test(String(path || ""))
+}
+
+// Renders page 1 of a PDF to <outBase>.png and reports "\t<size>\t<pages>"
+// so the caller can label the thumbnail without a second process.
+function buildPdfPreviewCommand(path, outBase) {
+  var quoted = shellQuote(path)
+  return [
+    "bash", "-c",
+    "if [ -f " + quoted + " ] && [ -r " + quoted + " ]; then"
+    + " sz=$(stat -Lc %s -- " + quoted + " 2>/dev/null);"
+    + " pg=$(pdfinfo " + quoted + " 2>/dev/null | awk '/^Pages:/ {print $2}');"
+    + ' printf "\\t%s\\t%s\\n" "${sz:-?}" "$pg";'
+    + " pdftoppm -png -f 1 -singlefile -scale-to 1200 " + quoted + " " + shellQuote(outBase) + " 2>/dev/null;"
+    + " else printf '\\t-1\\t\\n'; fi"
+  ]
+}
+
 function formatBytes(bytes) {
   var n = Number(bytes)
   if (!isFinite(n) || n < 0) return "? B"
@@ -220,6 +243,9 @@ if (typeof module !== "undefined") {
     cleanPath: cleanPath,
     shortenPath: shortenPath,
     isImagePath: isImagePath,
+    isPdfPath: isPdfPath,
+    isVideoPath: isVideoPath,
+    buildPdfPreviewCommand: buildPdfPreviewCommand,
     formatBytes: formatBytes
   }
 }

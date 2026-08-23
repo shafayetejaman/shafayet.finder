@@ -24,6 +24,7 @@ Item {
   property int browseSerial: 0
   property int previewSerial: 0
   property bool previewIsImage: false
+  property bool previewIsVideo: false
   property string previewSource: ""
   property string previewMeta: ""
   property string previewContent: ""
@@ -33,6 +34,11 @@ Item {
   readonly property int previewCacheLimit: 500
   property var previewCache: ({})
   property var previewCacheKeys: []
+  // Rendered first pages live at a fixed path; pdfCache remembers which
+  // document each render belongs to so revisits skip pdftoppm entirely.
+  readonly property string pdfPngBase: home + "/.local/state/omarchy/file-finder-pdf"
+  readonly property string pdfPngPath: pdfPngBase + ".png"
+  property var pdfCache: ({})
 
   // Shares the [menu] surface tokens — themes that style the menu also
   // style the finder, matching the clipboard overlay's approach.
@@ -84,6 +90,7 @@ Item {
     // Fresh previews each session so long-lived entries never go stale.
     root.previewCache = ({})
     root.previewCacheKeys = []
+    root.pdfCache = ({})
     root.rebuildDisplay()
     root.refreshScan()
     searchDebounce.restart()
@@ -261,6 +268,7 @@ Item {
 
   function clearPreview() {
     root.previewIsImage = false
+    root.previewIsVideo = false
     root.previewSource = ""
     root.previewMeta = ""
     root.previewContent = ""
@@ -274,6 +282,7 @@ Item {
     }
 
     var marked = row.path
+    root.previewIsVideo = false
 
     if (FinderModel.isDirPath(marked)) {
       root.previewIsImage = false
@@ -293,6 +302,38 @@ Item {
       previewProc.currentPath = cleanDir
       previewProc.command = FinderModel.buildDirPreviewCommand(cleanDir)
       previewProc.running = true
+      return
+    }
+
+    if (FinderModel.isPdfPath(marked)) {
+      var cleanPdf = FinderModel.cleanPath(marked)
+      var pdfHit = root.pdfCache[cleanPdf]
+      if (pdfHit) {
+        root.previewIsImage = true
+        root.previewSource = pdfHit.source
+        root.previewMeta = pdfHit.meta
+        root.previewContent = ""
+        return
+      }
+      if (previewProc.running) {
+        previewDebounce.restart()
+        return
+      }
+      root.previewSerial++
+      previewProc.kind = "pdf"
+      previewProc.revision = root.previewSerial
+      previewProc.currentPath = cleanPdf
+      previewProc.command = FinderModel.buildPdfPreviewCommand(cleanPdf, root.pdfPngBase)
+      previewProc.running = true
+      return
+    }
+
+    if (FinderModel.isVideoPath(marked)) {
+      root.previewIsImage = false
+      root.previewIsVideo = true
+      root.previewSource = ""
+      root.previewMeta = ""
+      root.previewContent = ""
       return
     }
 
@@ -420,11 +461,30 @@ Item {
     id: previewProc
     property int revision: 0
     property string currentPath: ""
+    property string kind: "file"
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         if (previewProc.revision !== root.previewSerial) return
         var parsed = FinderModel.parsePreviewOutput(text)
+        if (previewProc.kind === "pdf") {
+          if (parsed.size === -1) {
+            root.previewIsImage = false
+            root.previewMeta = "Unreadable file"
+            root.previewContent = ""
+            return
+          }
+          var label = "PDF"
+          var pages = parseInt(parsed.mtime, 10)
+          if (!isNaN(pages) && pages > 0) label += " · " + pages + (pages === 1 ? " page" : " pages")
+          if (parsed.size > 0) label += " · " + FinderModel.formatBytes(parsed.size)
+          root.previewIsImage = true
+          root.previewSource = Util.fileUrl(root.pdfPngPath)
+          root.previewMeta = label
+          root.previewContent = ""
+          root.pdfCache[previewProc.currentPath] = { meta: label, source: root.previewSource }
+          return
+        }
         if (parsed.size === -2) {
           var items = parseInt(parsed.mtime, 10)
           root.previewMeta = "Directory — " + (isNaN(items) ? "?" : items) + " items"
@@ -689,7 +749,7 @@ Item {
               }
 
               Text {
-                visible: !root.previewIsImage
+                visible: !root.previewIsImage && !root.previewIsVideo
                 anchors.top: parent.top
                 anchors.left: parent.left
                 anchors.bottom: parent.bottom
@@ -703,6 +763,32 @@ Item {
                 wrapMode: Text.WrapAnywhere
                 elide: Text.ElideRight
                 verticalAlignment: Text.AlignTop
+              }
+
+              Column {
+                visible: root.previewIsVideo
+                anchors.centerIn: parent
+                spacing: Style.space(8)
+
+                Text {
+                  text: ""
+                  color: root.selectedText
+                  opacity: 0.6
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.displayLarge * 2
+                  horizontalAlignment: Text.AlignHCenter
+                  width: parent.width
+                }
+
+                Text {
+                  text: "No video preview"
+                  color: root.foreground
+                  opacity: 0.55
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  horizontalAlignment: Text.AlignHCenter
+                  width: parent.width
+                }
               }
 
               Image {
