@@ -33,7 +33,6 @@ Item {
   property string lastFdKey: ""
   property var fdBaseRows: []
   property bool previewIsImage: false
-  property bool previewIsVideo: false
   property string previewSource: ""
   property string previewMeta: ""
   property string previewContent: ""
@@ -48,9 +47,10 @@ Item {
   // can never overwrite each other and nothing persists on disk.
   readonly property string pdfPngBase: home + "/.local/state/omarchy/file-finder-pdf"
   // path → { url }, url being a self-contained data:image/png;base64 payload
-  // held in memory. Storing bytes instead of pointing at a shared render file
-  // means an entry can never go stale under us — switching PDFs overwrites
-  // nothing, so arrowing between documents always shows each one's own page.
+  // held in memory (rendered PDF pages AND extracted video frames). Storing
+  // bytes instead of pointing at a shared render file means an entry can
+  // never go stale under us — switching items overwrites nothing, so
+  // arrowing around always shows each one's own thumbnail.
   readonly property int pdfCacheLimit: root.cfg.pdfCacheLimit
   property var pdfCache: ({})
   property var pdfCacheKeys: []
@@ -516,7 +516,6 @@ Item {
 
   function clearPreview() {
     root.previewIsImage = false
-    root.previewIsVideo = false
     root.previewSource = ""
     root.previewMeta = ""
     root.previewContent = ""
@@ -532,14 +531,20 @@ Item {
     var marked = row.path
 
     if (FinderModel.isVideoPath(marked)) {
-      root.previewIsImage = false
-      root.previewIsVideo = true
-      root.previewSource = ""
-      root.previewMeta = ""
-      root.previewContent = ""
+      var cleanVideo = FinderModel.cleanPath(marked)
+      var videoHit = root.cachedPdf(cleanVideo)
+      if (videoHit) {
+        root.previewIsImage = true
+        root.previewSource = videoHit.url
+        root.previewMeta = ""
+        root.previewContent = ""
+        root.prefetchNeighbors()
+        return
+      }
+      // Frame extraction is ffmpeg-heavy like PDF renders: not prefetched.
+      root.dispatchPreview("video", cleanVideo, marked, FinderModel.buildVideoThumbnailCommand(cleanVideo, root.pdfPngBase, root.cfg.pdfRenderScale))
       return
     }
-    root.previewIsVideo = false
 
     if (FinderModel.isImagePath(marked)) {
       root.previewIsImage = true
@@ -797,9 +802,8 @@ Item {
   }
 
   // Renders adjacent rows' previews into the cache ahead of time using spare
-  // workers, so arrowing through results feels instantaneous. Videos, images
-  // and PDFs are excluded — they need no process, decode off-thread already,
-  // or cost more than background churn is worth.
+  // workers, so arrowing through results feels instantaneous. Images need no
+  // process, and video/PDF renders cost more than background churn is worth.
   function prefetchNeighbors() {
     for (var d = -1; d <= 1; d += 2) {
       var idx = root.selectedIndex + d
@@ -825,7 +829,9 @@ Item {
     var selectedRow = activeRow(root.selectedIndex)
     var isSelected = selectedRow !== null && worker.displayKey !== "" && worker.displayKey === selectedRow.path
 
-    if (worker.kind === "pdf") {
+    // Rendered-thumbnail jobs (PDF pages, video frames) share one wire
+    // format and one bounded cache; only the producing command differs.
+    if (worker.kind === "pdf" || worker.kind === "video") {
       if (parsed.size === -1) {
         if (isSelected) {
           root.previewIsImage = false
@@ -896,24 +902,25 @@ Item {
     var marked = row.path
 
     if (FinderModel.isVideoPath(marked)) {
-      root.previewIsImage = false
-      root.previewIsVideo = true
-      root.previewSource = ""
-      root.previewMeta = ""
-      root.previewContent = ""
-      root.prefetchNeighbors()
-      return true
+      var videoHit = root.cachedPdf(FinderModel.cleanPath(marked))
+      if (videoHit) {
+        root.previewIsImage = true
+        root.previewSource = videoHit.url
+        root.previewMeta = ""
+        root.previewContent = ""
+        root.prefetchNeighbors()
+        return true
+      }
+      return false
     }
     if (FinderModel.isImagePath(marked)) {
       root.previewIsImage = true
-      root.previewIsVideo = false
       root.previewSource = Util.fileUrl(marked)
       root.previewMeta = ""
       root.previewContent = ""
       root.prefetchNeighbors()
       return true
     }
-    root.previewIsVideo = false
     root.previewIsImage = false
 
     var hit = null
@@ -1187,7 +1194,7 @@ font.pixelSize: root.cfg.contentCaption
               }
 
               Text {
-                visible: !root.previewIsImage && !root.previewIsVideo
+                visible: !root.previewIsImage
                 anchors.top: parent.top
                 anchors.left: parent.left
                 anchors.bottom: parent.bottom
@@ -1201,32 +1208,6 @@ font.pixelSize: root.cfg.contentCaption
                 wrapMode: Text.WrapAnywhere
                 elide: Text.ElideRight
                 verticalAlignment: Text.AlignTop
-              }
-
-              Column {
-                visible: root.previewIsVideo
-                anchors.centerIn: parent
-                spacing: Style.space(8)
-
-                Text {
-                  text: ""
-                  color: root.selectedText
-                  opacity: 0.6
-                  font.family: root.fontFamily
-                  font.pixelSize: root.cfg.contentDisplayLarge * 2
-                  horizontalAlignment: Text.AlignHCenter
-                  width: parent.width
-                }
-
-                Text {
-                  text: "No video preview"
-                  color: root.foreground
-                  opacity: 0.55
-                  font.family: root.fontFamily
-                  font.pixelSize: root.cfg.contentCaption
-                  horizontalAlignment: Text.AlignHCenter
-                  width: parent.width
-                }
               }
 
               Image {

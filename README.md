@@ -1,7 +1,7 @@
 # File Finder (shafayet.finder)
 
 Fuzzy file finder overlay for the Omarchy shell with live previews: text
-heads, directory listings, images, and PDF first-page renders.
+heads, directory listings, images, PDF first-page renders, and video frame grabs.
 
 ## Usage
 
@@ -90,12 +90,12 @@ stale runs are killed on every keystroke, so even aggressive values stay safe.
 | `max_browse_rows`     | int      | `200`             | Max rows shown in empty-query browse mode.                                                                                                                                                                                                                                                        |
 | `preview_byte_limit`  | int      | `65536`           | Bytes of file content or directory listing loaded per preview.                                                                                                                                                                                                                                    |
 | `preview_cache_limit` | int      | `500`             | LRU entries kept in memory across opens (per shell session).                                                                                                                                                                                                                                      |
-| `pdf_cache_limit`     | int      | `12`              | Rendered PDF thumbnails kept in memory across opens (LRU). Thumbnails are held as self-contained images, so entries never go stale; raise only if you browse many large documents.                                                                                                                |
+| `pdf_cache_limit`     | int      | `12`              | Rendered thumbnails (PDF pages and video frames) kept in memory across opens (LRU). Thumbnails are held as self-contained images, so entries never go stale; raise only if you browse many large documents.                                                                                       |
 | `preview_workers` | int | `3` | Concurrent preview processes; a slow PDF render never blocks text previews. Clamped to **1–3**: `1` means strictly serial previews, and more than 3 can never be used (selected row + two prefetched neighbors). |
 | `debounce_ms`         | int      | `40`              | Delay between keystroke/selection and its search/preview launch. Stale runs are killed by the next keystroke, so low values stay cheap — `25` feels near-instant.                                                                                                                                 |
 | `fd_debounce_ms`      | int      | `1000`            | Debounce for flag-mode queries (`--size +5mb …`). These walk real directory trees, so they wait for typing to settle before launching; every keystroke still kills the previous run eagerly.                                                                                                      |
 | `rescan_interval_ms`  | int      | `60000`           | Minimum time between full index rescans. Reopening the finder inside this window reuses the fresh index instead of re-walking every root. `0` rescans on every open.                                                                                                                              |
-| `pdf_render_scale`    | int      | `1200`            | `-scale-to` value passed to `pdftoppm` for page thumbnails.                                                                                                                                                                                                                                       |
+| `pdf_render_scale`    | int      | `1200`            | `-scale-to` value passed to `pdftoppm` for page thumbnails; also caps extracted video frame width.                                                                                                                                                                                                |
 | `show_hidden`         | bool     | `false`           | Skip dot files by default: hidden entries stay out of the index (fd's default) and out of directory previews; `true` adds `--hidden` to classic scans and shows everything. Note fd still surfaces dotfiles explicitly whitelisted in `.gitignore` (like `!.gitkeep`) regardless of this setting. |
 | `fd_flags`            | string[] | _(unset)_         | **Full override** of the flags given to every `fd` invocation — see below.                                                                                                                                                                                                                        |
 
@@ -189,9 +189,14 @@ Notes:
   nested/overlapping `search_dirs` can list a subtree more than once —
   same as listing it in several roots by hand.
 - Preview and PDF caches persist across open/close toggles for the whole
-  shell session; revisiting a file re-shows its preview instantly. PDF
-  thumbnails are kept as in-memory images (bounded by `pdf_cache_limit`),
-  so switching between documents always shows each one's own page.
+  shell session; revisiting a file re-shows its preview instantly. Rendered
+  thumbnails (PDF pages and video frames) are kept as in-memory images
+  (bounded by `pdf_cache_limit`), so switching between items always shows
+  each one's own thumbnail.
+- Video previews show a representative frame grabbed by `ffmpeg` (1s in,
+  falling back to the first frame for shorter clips) using the same
+  `pdf_render_scale` cap and thumbnail cache as PDFs. Without ffmpeg the
+  preview pane reports the file unreadable; everything else keeps working.
 - A search root listed in `ignored_dirs` is skipped entirely — the whole
   subtree stays out of the index.
 - Stale work stops eagerly: every keystroke kills superseded search,
@@ -202,3 +207,7 @@ Notes:
 - `Finder.qml` — overlay UI, process lifecycle, preview worker pool
 - `FinderModel.js` — pure helpers: settings resolution, path display,
   command builders (exercisable with `node`)
+
+## License
+
+[MIT](LICENSE)

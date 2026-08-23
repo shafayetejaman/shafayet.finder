@@ -291,6 +291,19 @@ eq(M.liveFdCommand(liveCfg, { args: [], fdPattern: "x", fzfQuery: "" }, 50), ["b
 ok(M.liveFdCommand(liveCfg, parse("--size +5mb"), 50)[2].indexOf("'.' \"${__p[@]}\"") !== -1,
   "empty pattern falls back to match-all")
 
+// ================= video thumbnail command =================
+
+var vt = M.buildVideoThumbnailCommand("/v/clip.mp4", "/tmp/thumbbase", 1200)[2]
+ok(vt.indexOf("ffmpeg") !== -1, "video cmd uses ffmpeg")
+ok(vt.indexOf("-frames:v 1") !== -1, "grabs exactly one frame")
+ok(/-ss 1 /.test(vt) && /-ss 0 /.test(vt), "seeks 1s, falls back to 0s for short clips")
+ok(vt.indexOf("-nostdin") !== -1, "ffmpeg never touches stdin")
+ok(vt.indexOf("scale=min(iw\\,1200):-2") !== -1, "aspect-preserving cap at render scale")
+ok(/wait "\$__p"/.test(vt), "ffmpeg relay-wrapped")
+ok(vt.indexOf('rm -f -- "$tmp"') !== -1, "scratch png always cleaned")
+eq(M.buildVideoThumbnailCommand("/v/clip.mp4", "/tmp/thumbbase")[2].indexOf("1200") !== -1,
+  true, "render scale defaults")
+
 // ================= integration: real execution =================
 // Executes generated scripts against a throwaway tree to prove the bash
 // itself behaves: dead-root isolation, policy excludes, caps, dirs-first.
@@ -411,6 +424,54 @@ ok(M.liveFdCommand(liveCfg, parse("--size +5mb"), 50)[2].indexOf("'.' \"${__p[@]
   cmd = M.buildPdfPreviewCommand(path.join(tmp, "missing.pdf"), path.join(tmp, "render"), 200)
   out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
   eq(M.parsePreviewOutput(out).size, -1, "integration: missing pdf reports unreadable")
+
+  fs.rmSync(tmp, { recursive: true, force: true })
+})()
+
+// Video thumbnail integration: renders a synthetic clip through the real
+// ffmpeg pipeline and proves the payload arrives as a decodable PNG data url
+// with no scratch file left behind. Skips silently when ffmpeg is absent.
+;(function integrationVideo() {
+  var probe = cp.spawnSync("ffmpeg", ["-version"], { encoding: "utf8" })
+  if (probe.error || probe.status !== 0) return
+
+  function makeClip(dest, seconds) {
+    var gen = cp.spawnSync("ffmpeg",
+      ["-hide_banner", "-loglevel", "error",
+       "-f", "lavfi", "-i", "color=c=red:s=64x64:d=" + seconds,
+       "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", dest],
+      { encoding: "utf8" })
+    return gen.status === 0 && fs.existsSync(dest)
+  }
+
+  var tmp = fs.mkdtempSync(path.join(os.tmpdir(), "finder-video-"))
+  var base = path.join(tmp, "thumb")
+  var vid = path.join(tmp, "clip.mp4")
+
+  if (!makeClip(vid, 3)) {
+    fs.rmSync(tmp, { recursive: true, force: true })
+    return
+  }
+  var cmd = M.buildVideoThumbnailCommand(vid, base, 200)
+  var out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+  var parsed = M.parsePreviewOutput(out)
+  ok(parsed.size > 0, "integration: video header reports a size")
+  ok(M.pdfDataUrl(parsed.content).indexOf("data:image/png;base64,iVBOR") === 0,
+    "integration: video payload is a PNG data url")
+  ok(fs.readdirSync(tmp).filter(function (f) { return f.slice(-4) === ".png" }).length === 0,
+    "integration: video scratch png removed")
+
+  // Sub-second clip exercises the -ss 1 -> -ss 0 retry.
+  var shortVid = path.join(tmp, "short.mp4")
+  if (makeClip(shortVid, 0.4)) {
+    cmd = M.buildVideoThumbnailCommand(shortVid, base, 200)
+    out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+    ok(M.parsePreviewOutput(out).size > 0, "integration: sub-second clip still yields a frame")
+  }
+
+  cmd = M.buildVideoThumbnailCommand(path.join(tmp, "missing.mp4"), base, 200)
+  out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+  eq(M.parsePreviewOutput(out).size, -1, "integration: missing video reports unreadable")
 
   fs.rmSync(tmp, { recursive: true, force: true })
 })()

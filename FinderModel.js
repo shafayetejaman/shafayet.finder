@@ -723,6 +723,40 @@ function pdfDataUrl(b64) {
   return "data:image/png;base64," + String(b64 || "").replace(/\s+/g, "")
 }
 
+// Grabs one representative frame of a video into a per-job scratch PNG
+// ("base-job-<pid>.png", same scheme as PDF renders) and reports
+// "\t<size>\t" followed by the image as base64 text — identical wire format,
+// so the payload lands in the same bounded in-memory cache. Seeks 1s in for
+// a representative frame; videos shorter than that (or with no decodable
+// frame at 1s) retry from 0s, and only then report size -1. ffmpeg is
+// relay-wrapped to die on stale teardown, -nostdin keeps it from ever
+// eating a collector's stdin, and the scratch file is removed even after
+// failed runs; only a SIGKILLed mid-extract job could leak one.
+function buildVideoThumbnailCommand(path, outBase, scale) {
+  if (scale === undefined) scale = pdfRenderScale
+  var quoted = shellQuote(path)
+  var grab = function (ss) {
+    return termRelay("ffmpeg -nostdin -hide_banner -loglevel error -ss " + ss
+      + " -i " + quoted
+      + " -frames:v 1 -map v:0 -vf 'scale=min(iw\\," + scale + "):-2'"
+      + " -y \"$tmp\"") + ";"
+  }
+  return [
+    "bash", "-c",
+    "if [ -f " + quoted + " ] && [ -r " + quoted + " ]; then"
+    + " sz=$(stat -Lc %s -- " + quoted + " 2>/dev/null);"
+    + " tmp=" + shellQuote(outBase) + '-job-"$$".png;'
+    + grab(1)
+    + " if [ ! -s \"$tmp\" ]; then " + grab(0) + " fi;"
+    + " if [ -s \"$tmp\" ]; then"
+    + ' printf "\\t%s\\t\\n" "${sz:-?}";'
+    + " base64 -w0 \"$tmp\";"
+    + " else printf '\\t-1\\t\\n'; fi;"
+    + " rm -f -- \"$tmp\";"
+    + " else printf '\\t-1\\t\\n'; fi"
+  ]
+}
+
 function formatBytes(bytes) {
   var n = Number(bytes)
   if (!isFinite(n) || n < 0) return "? B"
@@ -799,6 +833,7 @@ if (typeof module !== "undefined") {
     isPdfPath: isPdfPath,
     isVideoPath: isVideoPath,
     buildPdfPreviewCommand: buildPdfPreviewCommand,
+    buildVideoThumbnailCommand: buildVideoThumbnailCommand,
     pdfDataUrl: pdfDataUrl,
     formatBytes: formatBytes
   }
