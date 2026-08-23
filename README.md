@@ -126,7 +126,7 @@ stale runs are killed on every keystroke, so even aggressive values stay safe.
 | `debounce_ms`         | int      | `40`              | Delay between keystroke/selection and its search/preview launch. Stale runs are killed by the next keystroke, so low values stay cheap — `25` feels near-instant.                                                                                                                                 |
 | `fd_debounce_ms`      | int      | `1000`            | Debounce for flag-mode queries (`--size +5mb …`). These walk real directory trees, so they wait for typing to settle before launching; every keystroke still kills the previous run eagerly.                                                                                                      |
 | `rescan_interval_ms`  | int      | `60000`           | Minimum time between full index rescans. Reopening the finder inside this window reuses the fresh index instead of re-walking every root. `0` rescans on every open.                                                                                                                              |
-| `pdf_render_scale`    | int      | `1200`            | `-scale-to` value passed to `pdftoppm` for page thumbnails; also caps extracted video frame width.                                                                                                                                                                                                |
+| `pdf_render_scale`    | int      | `1200`            | `-scale-to` value passed to `pdftoppm` for page thumbnails; also caps extracted video frame width. Clamped to **64–4000**. |
 | `show_hidden`         | bool     | `false`           | Skip dot files by default: hidden entries stay out of the index (fd's default) and out of directory previews; `true` adds `--hidden` to classic scans and shows everything. Note fd still surfaces dotfiles explicitly whitelisted in `.gitignore` (like `!.gitkeep`) regardless of this setting. |
 | `fd_flags`            | string[] | _(unset)_         | **Full override** of the flags given to every `fd` invocation — see below.                                                                                                                                                                                                                        |
 
@@ -223,7 +223,11 @@ Notes:
   shell session; revisiting a file re-shows its preview instantly. Rendered
   thumbnails (PDF pages and video frames) are kept as in-memory images
   (bounded by `pdf_cache_limit`), so switching between items always shows
-  each one's own thumbnail.
+  each one's own thumbnail. A render larger than 3 MB of PNG is refused and
+  reported as "Thumbnail too large" instead of being loaded, so a crafted
+  document or an extreme `pdf_render_scale` cannot balloon memory; renders
+  happen inside private mode-0700 scratch directories that are removed
+  afterwards.
 - Video previews show a representative frame grabbed by `ffmpeg` (1s in,
   falling back to the first frame for shorter clips) using the same
   `pdf_render_scale` cap and thumbnail cache as PDFs. Without ffmpeg the

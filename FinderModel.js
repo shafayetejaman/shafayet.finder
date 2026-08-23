@@ -13,6 +13,11 @@ var debounceMs = 40
 var fdDebounceMs = 1000
 var rescanIntervalMs = 60000
 var pdfRenderScale = 1200
+// Rendered-thumbnail hardening: producers refuse to ship any PNG larger than
+// this many bytes — a crafted document/media file or an oversized render
+// scale could otherwise balloon into the StdioCollector and stay resident in
+// the in-memory cache (base64 inflates bytes ~4/3 on the wire).
+var thumbPngByteCeiling = 3 * 1024 * 1024
 var fontTitle = 13
 var fontCaption = 12
 var fontHeading = 16
@@ -142,7 +147,10 @@ function resolveSettings(settings, home) {
     debounceMs: nonNegativeInt(settings, "debounce_ms", debounceMs),
     fdDebounceMs: nonNegativeInt(settings, "fd_debounce_ms", fdDebounceMs),
     rescanIntervalMs: nonNegativeInt(settings, "rescan_interval_ms", rescanIntervalMs),
-    pdfRenderScale: positiveInt(settings, "pdf_render_scale", pdfRenderScale),
+    // Clamped 64..4000: bounds the thumbnail render on both axes (pdftoppm's
+    // long edge, ffmpeg's width) so a huge shell.json value can never ask a
+    // producer for an enormous PNG in the first place.
+    pdfRenderScale: Math.min(4000, Math.max(64, positiveInt(settings, "pdf_render_scale", pdfRenderScale))),
     showHidden: boolSetting(settings, "show_hidden", false),
     contentFontSize: positiveInt(settings, "content_font_size", fontTitle),
     contentCaption: positiveInt(settings, "content_caption", fontCaption),
@@ -689,51 +697,66 @@ function isVideoPath(path) {
   return /\.(mp4|mkv|webm|mov|avi|m4v|mpg|mpeg|wmv|flv|m2ts|ts|3gp|ogv)$/i.test(String(path || ""))
 }
 
-// Renders page 1 of a PDF into a per-job scratch PNG ("base-job-<pid>.png",
-// so overlapping or killed renders can never read each other's pixels) and
-// reports "\t<size>\t" followed by the image as base64 text, so the whole
-// payload survives the stdout text collector and can live in an in-memory
-// cache instead of aliasing a shared file that the next render overwrites.
-// pdftoppm is relay-wrapped to die on stale-process teardown, and the header
-// is only printed after checking that a non-empty PNG actually landed: a
-// corrupt or unreadable document reports size -1 instead of being cached as
-// successfully rendered. The scratch file is removed even after failed
+// Renders page 1 of a PDF into a per-job PRIVATE scratch directory
+// ("<base>.XXXXXX", mktemp -d's mode-0700 regardless of umask — so
+// overlapping or killed renders can never read each other's pixels and no
+// other user can read ours) and reports "\t<size>\t" followed by the image
+// as base64 text, so the whole payload survives the stdout text collector
+// and can live in an in-memory cache instead of aliasing a shared file that
+// the next render overwrites. pdftoppm is relay-wrapped to die on
+// stale-process teardown. Producer-side ceiling: only a non-empty PNG at or
+// under thumbPngByteCeiling bytes is shipped; an over-ceiling render
+// reports the -3 marker instead of flooding the collector, and a corrupt or
+// unreadable document reports size -1 rather than being cached as
+// successfully rendered. The scratch directory is removed even after failed
 // renders; only a SIGKILLed mid-render job could leak one.
-function buildPdfPreviewCommand(path, outBase, scale) {
+function buildPdfPreviewCommand(path, outBase, scale, ceiling) {
   if (scale === undefined) scale = pdfRenderScale
+  if (!isFinite(ceiling) || ceiling <= 0) ceiling = thumbPngByteCeiling
   var quoted = shellQuote(path)
   return [
     "bash", "-c",
-    "if [ -f " + quoted + " ] && [ -r " + quoted + " ]; then"
+    "umask 077;"
+    + " if [ -f " + quoted + " ] && [ -r " + quoted + " ]; then"
     + " sz=$(stat -Lc %s -- " + quoted + " 2>/dev/null);"
-    + " tmp=" + shellQuote(outBase) + '-job-"$$".png;'
+    + " tmpd=$(mktemp -d -- " + shellQuote(outBase) + ".XXXXXX) || { printf '\\t-1\\t\\n'; exit 0; };"
+    + " tmp=\"$tmpd/page.png\";"
     + " " + termRelay("pdftoppm -png -f 1 -singlefile -scale-to " + scale + " " + quoted + " \"${tmp%.png}\"") + ";"
     + " if [ -s \"$tmp\" ]; then"
+    + " if [ \"$(stat -Lc %s -- \"$tmp\")\" -le " + ceiling + " ]; then"
     + ' printf "\\t%s\\t\\n" "${sz:-?}";'
     + " base64 -w0 \"$tmp\";"
+    + " else printf '\\t-3\\t\\n'; fi"
     + " else printf '\\t-1\\t\\n'; fi;"
-    + " rm -f -- \"$tmp\";"
+    + " rm -rf -- \"$tmpd\";"
     + " else printf '\\t-1\\t\\n'; fi"
   ]
 }
 
 // Wraps base64 PNG bytes into a self-contained <img> source. Whitespace must
-// go: base64's trailing newline would corrupt the data URI.
+// go: base64's trailing newline would corrupt the data URI. Returns "" when
+// the payload is empty or exceeds the producer ceiling — callers treat ""
+// as "thumbnail unavailable" instead of ever constructing an unbounded data
+// URL (defense in depth against a misbehaving or future-edited producer).
 function pdfDataUrl(b64) {
-  return "data:image/png;base64," + String(b64 || "").replace(/\s+/g, "")
+  var s = String(b64 || "").replace(/\s+/g, "")
+  if (s.length === 0 || s.length > Math.ceil(thumbPngByteCeiling / 3) * 4) return ""
+  return "data:image/png;base64," + s
 }
 
-// Grabs one representative frame of a video into a per-job scratch PNG
-// ("base-job-<pid>.png", same scheme as PDF renders) and reports
-// "\t<size>\t" followed by the image as base64 text — identical wire format,
-// so the payload lands in the same bounded in-memory cache. Seeks 1s in for
-// a representative frame; videos shorter than that (or with no decodable
-// frame at 1s) retry from 0s, and only then report size -1. ffmpeg is
-// relay-wrapped to die on stale teardown, -nostdin keeps it from ever
-// eating a collector's stdin, and the scratch file is removed even after
-// failed runs; only a SIGKILLed mid-extract job could leak one.
-function buildVideoThumbnailCommand(path, outBase, scale) {
+// Grabs one representative frame of a video into a per-job PRIVATE scratch
+// directory ("<base>.XXXXXX", same mktemp -d scheme as PDF renders) and
+// reports "\t<size>\t" followed by the image as base64 text — identical wire
+// format and identical producer-side ceiling, so the payload lands in the
+// same bounded in-memory cache. Seeks 1s in for a representative frame;
+// videos shorter than that (or with no decodable frame at 1s) retry from 0s,
+// and only then report size -1; an over-ceiling frame reports size -3.
+// ffmpeg is relay-wrapped to die on stale teardown, -nostdin keeps it from
+// ever eating a collector's stdin, and the scratch directory is removed even
+// after failed runs; only a SIGKILLed mid-extract job could leak one.
+function buildVideoThumbnailCommand(path, outBase, scale, ceiling) {
   if (scale === undefined) scale = pdfRenderScale
+  if (!isFinite(ceiling) || ceiling <= 0) ceiling = thumbPngByteCeiling
   var quoted = shellQuote(path)
   var grab = function (ss) {
     return termRelay("ffmpeg -nostdin -hide_banner -loglevel error -ss " + ss
@@ -743,16 +766,20 @@ function buildVideoThumbnailCommand(path, outBase, scale) {
   }
   return [
     "bash", "-c",
-    "if [ -f " + quoted + " ] && [ -r " + quoted + " ]; then"
+    "umask 077;"
+    + " if [ -f " + quoted + " ] && [ -r " + quoted + " ]; then"
     + " sz=$(stat -Lc %s -- " + quoted + " 2>/dev/null);"
-    + " tmp=" + shellQuote(outBase) + '-job-"$$".png;'
+    + " tmpd=$(mktemp -d -- " + shellQuote(outBase) + ".XXXXXX) || { printf '\\t-1\\t\\n'; exit 0; };"
+    + " tmp=\"$tmpd/page.png\";"
     + grab(1)
     + " if [ ! -s \"$tmp\" ]; then " + grab(0) + " fi;"
     + " if [ -s \"$tmp\" ]; then"
+    + " if [ \"$(stat -Lc %s -- \"$tmp\")\" -le " + ceiling + " ]; then"
     + ' printf "\\t%s\\t\\n" "${sz:-?}";'
     + " base64 -w0 \"$tmp\";"
+    + " else printf '\\t-3\\t\\n'; fi"
     + " else printf '\\t-1\\t\\n'; fi;"
-    + " rm -f -- \"$tmp\";"
+    + " rm -rf -- \"$tmpd\";"
     + " else printf '\\t-1\\t\\n'; fi"
   ]
 }
@@ -834,6 +861,7 @@ if (typeof module !== "undefined") {
     isVideoPath: isVideoPath,
     buildPdfPreviewCommand: buildPdfPreviewCommand,
     buildVideoThumbnailCommand: buildVideoThumbnailCommand,
+    thumbPngByteCeiling: thumbPngByteCeiling,
     pdfDataUrl: pdfDataUrl,
     formatBytes: formatBytes
   }

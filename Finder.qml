@@ -42,9 +42,10 @@ Item {
   readonly property int previewCacheLimit: root.cfg.previewCacheLimit
   property var previewCache: ({})
   property var previewCacheKeys: []
-  // Scratch base for pdftoppm runs: each job appends its own "-<pid>.png"
-  // suffix and removes the file afterwards, so concurrent or killed renders
-  // can never overwrite each other and nothing persists on disk.
+  // Scratch template for pdftoppm/ffmpeg jobs: each job mktemp -d's its own
+  // private mode-0700 directory ("<base>.XXXXXX"), renders inside it, and
+  // removes the directory afterwards, so concurrent or killed renders can
+  // never overwrite each other and nothing persists on disk.
   readonly property string pdfPngBase: home + "/.local/state/omarchy/file-finder-pdf"
   // path → { url }, url being a self-contained data:image/png;base64 payload
   // held in memory (rendered PDF pages AND extracted video frames). Storing
@@ -840,7 +841,18 @@ Item {
         }
         return
       }
+      // Oversized renders are refused producer-side (-3) and re-checked here
+      // before any data URL exists. Left uncached, so lowering
+      // pdf_render_scale (or fixing the file) succeeds on the next look.
       var url = FinderModel.pdfDataUrl(parsed.content)
+      if (parsed.size === -3 || url === "") {
+        if (isSelected) {
+          root.previewIsImage = false
+          root.previewMeta = "Thumbnail too large"
+          root.previewContent = ""
+        }
+        return
+      }
       root.storePdfInCache(worker.currentPath, url)
       if (isSelected) {
         // No meta line for PDFs: the page thumbnail owns the whole pane.

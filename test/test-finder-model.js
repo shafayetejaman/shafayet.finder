@@ -51,6 +51,10 @@ eq(M.resolveSettings({}, HOME).previewWorkers, 3, "default worker count is 3")
 eq(M.resolveSettings({ preview_workers: 10 }, HOME).previewWorkers, 3, "worker count clamps to 3")
 eq(M.resolveSettings({ preview_workers: 1 }, HOME).previewWorkers, 1, "one worker means serial previews")
 eq(M.resolveSettings({ preview_workers: 0 }, HOME).previewWorkers, M.previewWorkers, "invalid worker count falls back")
+eq(M.resolveSettings({}, HOME).pdfRenderScale, M.pdfRenderScale, "default render scale")
+eq(M.resolveSettings({ pdf_render_scale: 100000 }, HOME).pdfRenderScale, 4000, "render scale clamps high")
+eq(M.resolveSettings({ pdf_render_scale: 1 }, HOME).pdfRenderScale, 64, "render scale clamps low")
+eq(M.resolveSettings({ pdf_render_scale: "abc" }, HOME).pdfRenderScale, M.pdfRenderScale, "garbage render scale falls back")
 
 // ================= expandPath =================
 
@@ -165,16 +169,21 @@ ok(dp[2].indexOf("grep -v '^\\.'") !== -1, "dot entries filtered when hidden")
 // ================= pdf preview =================
 
 eq(M.pdfDataUrl("iVBOR\n"), "data:image/png;base64,iVBOR", "pdf data url strips whitespace")
-eq(M.pdfDataUrl(""), "data:image/png;base64,", "pdf data url tolerates empty payload")
+eq(M.pdfDataUrl(""), "", "pdf data url rejects empty payload")
+var oversize = new Array(Math.ceil(M.thumbPngByteCeiling / 3) * 4 + 2).join("A")
+eq(M.pdfDataUrl(oversize), "", "pdf data url rejects over-ceiling payload")
 
 var pc = M.buildPdfPreviewCommand("/my pdf.pdf", "/tmp/base", 800)
 ok(pc[2].indexOf("pdftoppm -png -f 1 -singlefile -scale-to 800 '/my pdf.pdf' \"${tmp%.png}\"") !== -1,
   "pdf render targets per-job scratch outbase")
-ok(pc[2].indexOf("-job-\"$$\".png;") !== -1, "scratch name unique per job")
+ok(pc[2].indexOf("umask 077;") === 0, "scratch work runs under private umask")
+ok(pc[2].indexOf("mktemp -d -- '/tmp/base'.XXXXXX") !== -1, "per-job private scratch dir")
+ok(pc[2].indexOf('tmp="$tmpd/page.png"') !== -1, "render lands inside the private dir")
 ok(pc[2].indexOf("base64 -w0 \"$tmp\"") !== -1, "payload emitted as base64 text")
-ok(pc[2].indexOf("rm -f -- \"$tmp\";") !== -1, "scratch cleaned up")
+ok(pc[2].indexOf("-le " + M.thumbPngByteCeiling) !== -1, "producer-side png byte ceiling enforced")
+ok(pc[2].indexOf("printf '\\t-3\\t\\n'") !== -1, "oversize marker present")
 ok(pc[2].indexOf("printf '\\t-1\\t\\n'") !== -1, "unreadable marker present")
-ok(pc[2].indexOf("head -c") === -1, "pdf payload not byte-capped")
+ok(pc[2].indexOf("rm -rf -- \"$tmpd\";") !== -1, "private scratch dir cleaned up")
 
 // ================= misc regressions =================
 
@@ -300,7 +309,11 @@ ok(/-ss 1 /.test(vt) && /-ss 0 /.test(vt), "seeks 1s, falls back to 0s for short
 ok(vt.indexOf("-nostdin") !== -1, "ffmpeg never touches stdin")
 ok(vt.indexOf("scale=min(iw\\,1200):-2") !== -1, "aspect-preserving cap at render scale")
 ok(/wait "\$__p"/.test(vt), "ffmpeg relay-wrapped")
-ok(vt.indexOf('rm -f -- "$tmp"') !== -1, "scratch png always cleaned")
+ok(vt.indexOf("umask 077;") === 0, "video scratch work runs under private umask")
+ok(vt.indexOf("mktemp -d -- '/tmp/thumbbase'.XXXXXX") !== -1, "per-job private scratch dir")
+ok(vt.indexOf("-le " + M.thumbPngByteCeiling) !== -1 && vt.indexOf("printf '\\t-3\\t\\n'") !== -1,
+  "producer-side png byte ceiling enforced")
+ok(vt.indexOf('rm -rf -- "$tmpd"') !== -1, "private scratch dir always cleaned")
 eq(M.buildVideoThumbnailCommand("/v/clip.mp4", "/tmp/thumbbase")[2].indexOf("1200") !== -1,
   true, "render scale defaults")
 
@@ -417,8 +430,14 @@ eq(M.buildVideoThumbnailCommand("/v/clip.mp4", "/tmp/thumbbase")[2].indexOf("120
   ok(parsed.size > 0, "integration: pdf header reports a size")
   ok(M.pdfDataUrl(parsed.content).indexOf("data:image/png;base64,iVBOR") === 0,
     "integration: payload is a PNG data url")
-  ok(fs.readdirSync(tmp).filter(function (f) { return f.slice(-4) === ".png" }).length === 0,
-    "integration: scratch png removed")
+  eq(fs.readdirSync(tmp).length, 1, "integration: private scratch dir removed, only doc.pdf left")
+
+  // Oversize refusal: an absurdly low ceiling must produce the -3 marker,
+  // never a payload, and must still clean up the private scratch dir.
+  cmd = M.buildPdfPreviewCommand(pdf, path.join(tmp, "render"), 200, 64)
+  out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+  eq(M.parsePreviewOutput(out).size, -3, "integration: over-ceiling render reports too-large")
+  eq(fs.readdirSync(tmp).length, 1, "integration: scratch dir removed even on refusal")
 
   // Unreadable path reports the -1 marker instead of a payload.
   cmd = M.buildPdfPreviewCommand(path.join(tmp, "missing.pdf"), path.join(tmp, "render"), 200)
@@ -458,8 +477,15 @@ eq(M.buildVideoThumbnailCommand("/v/clip.mp4", "/tmp/thumbbase")[2].indexOf("120
   ok(parsed.size > 0, "integration: video header reports a size")
   ok(M.pdfDataUrl(parsed.content).indexOf("data:image/png;base64,iVBOR") === 0,
     "integration: video payload is a PNG data url")
-  ok(fs.readdirSync(tmp).filter(function (f) { return f.slice(-4) === ".png" }).length === 0,
-    "integration: video scratch png removed")
+  eq(fs.readdirSync(tmp).filter(function (f) { return f !== "clip.mp4" }).length, 0,
+    "integration: video scratch dir removed, only the clip left")
+
+  // Oversize refusal with an absurdly low ceiling: -3 marker, still cleaned up.
+  cmd = M.buildVideoThumbnailCommand(vid, base, 200, 64)
+  out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+  eq(M.parsePreviewOutput(out).size, -3, "integration: over-ceiling frame reports too-large")
+  eq(fs.readdirSync(tmp).filter(function (f) { return f !== "clip.mp4" }).length, 0,
+    "integration: video scratch dir removed even on refusal")
 
   // Sub-second clip exercises the -ss 1 -> -ss 0 retry.
   var shortVid = path.join(tmp, "short.mp4")
