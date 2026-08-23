@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "shafayet.finder",
+  "name": "File Finder",
+  "version": "1.0.0",
+  "author": "Shafayet",
+  "description": "Fuzzy file finder with live preview",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Finder.qml"
+  }
+}
