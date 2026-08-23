@@ -28,6 +28,12 @@ Item {
   property string previewMeta: ""
   property string previewContent: ""
 
+  // path → { meta, content }, oldest-first key list for eviction. Read and
+  // written imperatively only, so no binding ever depends on it.
+  readonly property int previewCacheLimit: 500
+  property var previewCache: ({})
+  property var previewCacheKeys: []
+
   // Shares the [menu] surface tokens — themes that style the menu also
   // style the finder, matching the clipboard overlay's approach.
   property color background: Color.menu.background
@@ -75,6 +81,9 @@ Item {
     root.cursorActive = true
     root.disarmPointer()
     root.clearPreview()
+    // Fresh previews each session so long-lived entries never go stale.
+    root.previewCache = ({})
+    root.previewCacheKeys = []
     root.rebuildDisplay()
     root.refreshScan()
     searchDebounce.restart()
@@ -234,6 +243,22 @@ Item {
     Util.execDetached("nautilus --select " + Util.shellQuote(FinderModel.cleanPath(row.path)))
   }
 
+  function cachedPreview(path) {
+    return root.previewCache[path] || null
+  }
+
+  function storePreviewInCache(path, meta, content) {
+    if (!path) return
+    var cache = root.previewCache
+    if (!cache[path]) {
+      var keys = root.previewCacheKeys.slice()
+      keys.push(path)
+      while (keys.length > root.previewCacheLimit) delete cache[keys.shift()]
+      root.previewCacheKeys = keys
+    }
+    cache[path] = { meta: meta, content: content }
+  }
+
   function clearPreview() {
     root.previewIsImage = false
     root.previewSource = ""
@@ -252,13 +277,21 @@ Item {
 
     if (FinderModel.isDirPath(marked)) {
       root.previewIsImage = false
+      var cleanDir = FinderModel.cleanPath(marked)
+      var dirHit = root.cachedPreview(cleanDir)
+      if (dirHit) {
+        root.previewMeta = dirHit.meta
+        root.previewContent = dirHit.content
+        return
+      }
       if (previewProc.running) {
         previewDebounce.restart()
         return
       }
       root.previewSerial++
       previewProc.revision = root.previewSerial
-      previewProc.command = FinderModel.buildDirPreviewCommand(FinderModel.cleanPath(marked))
+      previewProc.currentPath = cleanDir
+      previewProc.command = FinderModel.buildDirPreviewCommand(cleanDir)
       previewProc.running = true
       return
     }
@@ -273,14 +306,21 @@ Item {
     }
 
     root.previewIsImage = false
-    root.previewSerial++
+    var fileHit = root.cachedPreview(marked)
+    if (fileHit) {
+      root.previewMeta = fileHit.meta
+      root.previewContent = fileHit.content
+      return
+    }
     if (previewProc.running) {
       // A Process ignores a command change while running; retry once it exits
       // rather than silently losing this selection's preview.
       previewDebounce.restart()
       return
     }
+    root.previewSerial++
     previewProc.revision = root.previewSerial
+    previewProc.currentPath = marked
     previewProc.command = FinderModel.buildPreviewCommand(marked)
     previewProc.running = true
   }
@@ -379,6 +419,7 @@ Item {
   Process {
     id: previewProc
     property int revision: 0
+    property string currentPath: ""
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -388,9 +429,11 @@ Item {
           var items = parseInt(parsed.mtime, 10)
           root.previewMeta = "Directory — " + (isNaN(items) ? "?" : items) + " items"
           root.previewContent = parsed.content
+          root.storePreviewInCache(previewProc.currentPath, root.previewMeta, root.previewContent)
           return
         }
         if (parsed.size === -1) {
+          // Uncached so a file that reappears gets a fresh attempt.
           root.previewMeta = "Unreadable file"
           root.previewContent = ""
           return
@@ -398,12 +441,14 @@ Item {
         if (parsed.content.indexOf("\u0000") >= 0) {
           root.previewMeta = FinderModel.formatBytes(parsed.size) + " — binary file"
           root.previewContent = ""
+          root.storePreviewInCache(previewProc.currentPath, root.previewMeta, root.previewContent)
           return
         }
         var meta = FinderModel.formatBytes(parsed.size)
         if (parsed.mtime) meta += "  ·  " + parsed.mtime
         root.previewMeta = meta
         root.previewContent = parsed.content
+        root.storePreviewInCache(previewProc.currentPath, root.previewMeta, root.previewContent)
       }
     }
   }
