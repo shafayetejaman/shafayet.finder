@@ -47,6 +47,7 @@ plugin's `id` to the `plugins` array in `~/.config/omarchy/shell.json`:
       "pdf_cache_limit": 12,
       "preview_workers": 3,
       "debounce_ms": 25,
+      "fd_debounce_ms": 1000,
       "rescan_interval_ms": 300000,
       "pdf_render_scale": 1200,
       "show_hidden": false,
@@ -68,9 +69,13 @@ instant cached previews, less background rescanning):
 {
   "id": "shafayet.finder",
   "debounce_ms": 25,
+  "fd_debounce_ms": 200,
   "rescan_interval_ms": 300000,
 }
 ```
+
+Lowering `fd_debounce_ms` also speeds up flag-mode queries (`--size +5mb …`);
+stale runs are killed on every keystroke, so even aggressive values stay safe.
 
 ### Keys
 
@@ -86,7 +91,7 @@ instant cached previews, less background rescanning):
 | `preview_byte_limit`  | int      | `65536`           | Bytes of file content or directory listing loaded per preview.                                                                                                                                                                                                                                    |
 | `preview_cache_limit` | int      | `500`             | LRU entries kept in memory across opens (per shell session).                                                                                                                                                                                                                                      |
 | `pdf_cache_limit`     | int      | `12`              | Rendered PDF thumbnails kept in memory across opens (LRU). Thumbnails are held as self-contained images, so entries never go stale; raise only if you browse many large documents.                                                                                                                |
-| `preview_workers`     | int      | `3`               | Concurrent preview processes; a slow PDF render never blocks text previews.                                                                                                                                                                                                                       |
+| `preview_workers` | int | `3` | Concurrent preview processes; a slow PDF render never blocks text previews. Clamped to **1–3**: `1` means strictly serial previews, and more than 3 can never be used (selected row + two prefetched neighbors). |
 | `debounce_ms`         | int      | `40`              | Delay between keystroke/selection and its search/preview launch. Stale runs are killed by the next keystroke, so low values stay cheap — `25` feels near-instant.                                                                                                                                 |
 | `fd_debounce_ms`      | int      | `1000`            | Debounce for flag-mode queries (`--size +5mb …`). These walk real directory trees, so they wait for typing to settle before launching; every keystroke still kills the previous run eagerly.                                                                                                      |
 | `rescan_interval_ms`  | int      | `60000`           | Minimum time between full index rescans. Reopening the finder inside this window reuses the fresh index instead of re-walking every root. `0` rescans on every open.                                                                                                                              |
@@ -134,7 +139,10 @@ flag** and routed to a live `fd` walk over the configured `search_dirs`
 | `invoice` _(no flags)_       | — (classic index+fzf path)             | `invoice`    |
 | `--size +5mb invoice`        | flags + pattern `invoice`              | —            |
 | `--size=+5mb report paid`    | attached value + pattern `report`      | `paid`       |
-| `-e jpg png -- sunset beach` | `-e jpg png` + pattern `sunset`        | `beach`      |
+| `-e pdf .`                   | extension filter + match-all           | —            |
+| `--ext pdf .`                | same — `--ext` is accepted as an alias of `-e` | —    |
+| `-e jpg -e png report`       | repeated extensions + pattern `report` | —            |
+| `-E node_modules report`     | exclude glob + pattern `report`        | —            |
 | `--size +5mb .`              | flags + match-all, scoped to the roots | —            |
 | `--size +5mb` _(flags only)_ | nothing runs; list clears instantly    | —            |
 | `-- -weird`                  | everything after `--` is literal text  | `-weird`     |
@@ -145,15 +153,24 @@ Notes:
   `--size +5mb` (at least 5 MB), `--size -1gb` (at most 1 GB), `--size +2mb -10mb`… fd
   rejects the trailing form (`--size 2mb+`) outright, which then shows an
   empty list.
-- Value flags (`--size/-S`, `--type/-t`, `--max-depth/-d`, `--min-depth`,
-  `--changed-within`, `--changed-before`, `--max-results`) consume the next
-  token. Variadic flags (`--extension/-e`, `--exclude/-E`) swallow every
-  following non-flag token — like fd itself — so end the run with a
-  repeated flag or a bare `--` before typing your text.
+- Every value flag consumes exactly **one** following token — fd's CLI has no
+  variadic flags. This includes `--size/-S`, `--type/-t`, `--max-depth/-d`,
+  `--min-depth`, `--changed-within`, `--changed-before`, `--max-results`,
+  `--extension`/`--ext`/`-e`, and `--exclude/-E`. Repeat `-e`/`-E` for multiple
+  extensions or globs (`-e pdf -e txt .`), exactly as you would when running
+  fd directly. A bare `--` ends flag parsing; everything after it is literal
+  text. `--ext` (and `--ext=pdf`) is accepted as a finder-side alias for
+  fd's `--extension`, which fd itself does not provide.
 - Unknown flags pass through verbatim; a typo'd flag fails silently and
   just shows an empty result list.
-- The first text token matches fd-style (smart case); further tokens are
-  fuzzy-ranked by fzf on top of fd's output.
+- The first text token matches fd-style (smart case); the remaining tokens are
+  the staged query, ranked fzf-style. The flags+pattern walk runs once and its
+  full output is kept in memory: while it stays fixed, **editing the staged
+  text in either direction — adding or deleting words — refilters instantly
+  with no second walk, no debounce, and no clearing**, using an in-process
+  fzf approximation (whitespace terms AND independently, contiguity/boundary
+  scoring). Changing the flags, the pattern, or relevant settings re-walks
+  after `fd_debounce_ms`, which also re-syncs ranking with real fzf.
 - Policy ignores (`ignored_dirs`, `ignored_names`) are always enforced, and
   `--absolute-path` is forced regardless of what you type.
 - Flag mode reads the live disk, so it works even while the index is still

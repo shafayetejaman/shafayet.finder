@@ -136,7 +136,9 @@ function resolveSettings(settings, home) {
     previewByteLimit: positiveInt(settings, "preview_byte_limit", previewByteLimit),
     previewCacheLimit: positiveInt(settings, "preview_cache_limit", previewCacheLimit),
     pdfCacheLimit: positiveInt(settings, "pdf_cache_limit", pdfCacheLimit),
-    previewWorkers: positiveInt(settings, "preview_workers", previewWorkers),
+    // Clamped 1..3: one worker means strictly serial previews, and more than
+    // three slots can never be fed (selected row + two prefetched neighbors).
+    previewWorkers: Math.min(3, positiveInt(settings, "preview_workers", previewWorkers)),
     debounceMs: nonNegativeInt(settings, "debounce_ms", debounceMs),
     fdDebounceMs: nonNegativeInt(settings, "fd_debounce_ms", fdDebounceMs),
     rescanIntervalMs: nonNegativeInt(settings, "rescan_interval_ms", rescanIntervalMs),
@@ -392,7 +394,9 @@ function buildSearchCommand(listPath, query, displayLimit) {
 
 // ================= inline fd flags in the search box =================
 
-// Flags that consume exactly one following value token.
+// Flags that consume exactly one following value token — mirroring fd's own
+// CLI, where -e/-E also take a single value per occurrence. Multiple
+// extensions/excludes work by repeating the flag: "-e pdf -e txt .".
 var FD_VALUE_FLAGS = {
   "--size": 1, "-S": 1,
   "--type": 1, "-t": 1,
@@ -403,13 +407,15 @@ var FD_VALUE_FLAGS = {
   "--changed-before": 1,
   "--changed-after": 1,
   "--max-results": 1,
-}
-
-// Flags that swallow every following non-flag token, like fd itself. Use a
-// repeated flag or a bare "--" to end the run and start the text portion.
-var FD_VARIADIC_FLAGS = {
   "--extension": 1, "-e": 1,
   "--exclude": 1, "-E": 1,
+}
+
+// Convenience spellings fd itself rejects, rewritten before the command is
+// built so the live walk only ever sees real fd flags. Applies to both the
+// bare form (--ext pdf) and the attached form (--ext=pdf).
+var FD_FLAG_ALIASES = {
+  "--ext": "--extension",
 }
 
 function flagLike(token) {
@@ -418,9 +424,9 @@ function flagLike(token) {
 
 // Splits a raw query into fd flags and staged text:
 //   "invoice"                    -> { args: [], fdPattern: "", fzfQuery: "" }  (classic path)
-//   "--size 5mb+ invoice"        -> args [--size 5mb+], text "invoice"
-//   "--size=5mb+ report paid"    -> attached values work; "paid" goes to fzf
-//   "-e jpg png -- sunset beach" -> variadic ends at "--"; text after it
+//   "--size +5mb invoice"        -> args [--size +5mb], pattern "invoice"
+//   "--size=+5mb report paid"    -> attached values work; "paid" goes to fzf
+//   "-e pdf ."                   -> args [-e pdf], match-all pattern "."
 //   "-- -weird"                  -> everything after "--" is literal text
 // First text token becomes the fd pattern; the rest joins into the fzf query.
 function parseQuery(input) {
@@ -446,16 +452,23 @@ function parseQuery(input) {
       i++
       continue
     }
-    // A flag token: push verbatim and consume its value(s), if any.
-    args.push(token)
+    // A flag token: push verbatim (aliases rewritten) and consume its
+    // single value, if any.
+    var bare = token
+    var eq = token.indexOf("=")
+    if (eq !== -1) bare = token.substring(0, eq)
+    var canonical = FD_FLAG_ALIASES.hasOwnProperty(bare)
+      ? FD_FLAG_ALIASES[bare] + (eq === -1 ? "" : token.substring(eq))
+      : token
+    args.push(canonical)
     i++
-    var isValueFlag = FD_VALUE_FLAGS.hasOwnProperty(token)
-    if (!isValueFlag && !FD_VARIADIC_FLAGS.hasOwnProperty(token)) continue
-    if (token.indexOf("=") !== -1) continue // --flag=value carries its own
-    while (i < tokens.length && tokens[i] !== "--" && !flagLike(tokens[i])) {
+    // Unknown flags are booleans; attached "=value" forms skip consumption
+    // because they miss the table (keys are bare flag names).
+    if (!FD_VALUE_FLAGS.hasOwnProperty(canonical)) continue
+    if (canonical.indexOf("=") !== -1) continue // --flag=value carries its own
+    if (i < tokens.length && tokens[i] !== "--" && !flagLike(tokens[i])) {
       args.push(tokens[i])
       i++
-      if (isValueFlag) break
     }
   }
   return {
@@ -465,12 +478,14 @@ function parseQuery(input) {
   }
 }
 
-// Live fd search over all roots with user-supplied flags: one relay-wrapped,
-// guarded walk exactly like the index scan, then an optional fzf stage for
-// the second-and-further text tokens. Errors stay silent — a bad flag just
-// yields no lines.
-function liveFdCommand(cfg, parsed, displayLimit) {
-  if (displayLimit === undefined) displayLimit = maxDisplayRows
+// Live fd walk over all roots with user-supplied flags: one relay-wrapped,
+// guarded walk exactly like the index scan. Deliberately NO fzf stage and no
+// display cap here — the full (capped) walk is kept in memory as the baseline
+// for a query, and the staged text is filtered over that baseline client-side,
+// so editing or deleting staged words never re-walks. Errors stay silent — a
+// bad flag just yields no lines.
+function liveFdCommand(cfg, parsed, cap) {
+  if (cap === undefined) cap = maxScanResults
   if (!cfg || !cfg.searchDirs || cfg.searchDirs.length === 0 ||
       !parsed || !parsed.args || parsed.args.length === 0) {
     return ["bash", "-c", ""]
@@ -486,11 +501,89 @@ function liveFdCommand(cfg, parsed, displayLimit) {
     + termRelay("fd " + argStr + (ex ? " " + ex : "")
       + " " + shellQuote(parsed.fdPattern || ".") + " \"${__p[@]}\" 2>/dev/null")
     + " ; } 2>/dev/null )"
-  if (parsed.fzfQuery) {
-    script += " | fzf --filter " + shellQuote(parsed.fzfQuery) + " --scheme=path 2>/dev/null"
-  }
-  script += " | head -n " + displayLimit
+  script += " | head -n " + cap
   return ["bash", "-c", script]
+}
+
+// Stable identity of a live-fd run's expensive inputs: the canonical flags,
+// the pattern, and every setting that alters the walk. Deliberately excludes
+// fzfQuery — changing only the staged text must count as the same run so the
+// finder can narrow the already-loaded rows without re-walking.
+function fdCacheKey(cfg, parsed) {
+  if (!parsed || !parsed.args || parsed.args.length === 0 || !parsed.fdPattern) return ""
+  var sig = null
+  if (cfg) {
+    sig = [cfg.searchDirs, cfg.ignoredDirs, cfg.ignoreNames, cfg.showHidden,
+      cfg.fdFlags, cfg.fdOverrideArgs]
+  }
+  return JSON.stringify([parsed.args, parsed.fdPattern, sig])
+}
+
+// Smart-case fzf-style subsequence score for ONE term: per-char base plus
+// bonuses for contiguous runs and word/path boundaries. The greedy chain is
+// attempted from each of the first occurrences of the term's initial (capped)
+// and the best alignment wins, so a clean anchored match is never lost to an
+// earlier scattered one. Returns -1 when the term cannot be matched.
+function fuzzyScore(line, query) {
+  var text = String(line)
+  var q = String(query)
+  if (!/[A-Z]/.test(q)) { text = text.toLowerCase(); q = q.toLowerCase() }
+  if (!q) return 0
+  var starts = []
+  var idx = text.indexOf(q.charAt(0))
+  while (idx !== -1 && starts.length < 16) {
+    starts.push(idx)
+    idx = text.indexOf(q.charAt(0), idx + 1)
+  }
+  var best = -1
+  for (var s = 0; s < starts.length; s++) {
+    var score = 0
+    var run = 0
+    var prevIdx = starts[s] - 1
+    var from = starts[s]
+    var ok = true
+    for (var qi = 0; qi < q.length; qi++) {
+      idx = text.indexOf(q.charAt(qi), from)
+      if (idx === -1) { ok = false; break }
+      score += 16
+      if (idx === prevIdx + 1) { run++; score += 4 + run * 2 } else { run = 0 }
+      if (idx === 0 || !isWordChar(text.charAt(idx - 1))) score += 8
+      prevIdx = idx
+      from = idx + 1
+    }
+    if (ok && score > best) best = score
+  }
+  return best
+}
+
+function isWordChar(c) {
+  return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9")
+    || c === "_"
+}
+
+// Warm-edit filter over the in-memory baseline, mirroring fzf's --filter
+// semantics: whitespace-separated terms are ANDed independently (each must
+// subsequence-match somewhere), scores sum, order is score desc with input
+// order breaking ties. A blank query passes everything through untouched.
+function fuzzyFilterRows(rows, query) {
+  var list = Array.isArray(rows) ? rows : []
+  var terms = String(query == null ? "" : query).trim().split(/\s+/).filter(function (t) { return t })
+  if (terms.length === 0) return list.slice()
+  var scored = []
+  for (var i = 0; i < list.length; i++) {
+    var total = 0
+    var miss = false
+    for (var t = 0; t < terms.length; t++) {
+      var s = fuzzyScore(String(list[i]), terms[t])
+      if (s < 0) { miss = true; break }
+      total += s
+    }
+    if (!miss) scored.push({ row: list[i], score: total, i: i })
+  }
+  scored.sort(function (a, b) { return b.score - a.score || a.i - b.i })
+  var out = []
+  for (var j = 0; j < scored.length; j++) out.push(scored[j].row)
+  return out
 }
 
 function buildPreviewCommand(path, byteLimit) {
@@ -686,9 +779,11 @@ if (typeof module !== "undefined") {
     shellQuote: shellQuote,
     fdDebounceMs: fdDebounceMs,
     FD_VALUE_FLAGS: FD_VALUE_FLAGS,
-    FD_VARIADIC_FLAGS: FD_VARIADIC_FLAGS,
+    FD_FLAG_ALIASES: FD_FLAG_ALIASES,
     parseQuery: parseQuery,
     liveFdCommand: liveFdCommand,
+    fdCacheKey: fdCacheKey,
+    fuzzyFilterRows: fuzzyFilterRows,
     deleteLastWord: deleteLastWord,
     markDirectories: markDirectories,
     buildSearchCommand: buildSearchCommand,

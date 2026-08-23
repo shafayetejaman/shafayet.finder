@@ -25,6 +25,13 @@ Item {
   property int fdSerial: 0
   property bool scanQueued: false
   property double lastScanFinishedAt: 0
+
+  // Identity (FinderModel.fdCacheKey) of the last COMPLETED live-fd run plus
+  // its full walk output. The walk carries NO fzf stage: every staged-text
+  // edit — typed or deleted — refilters fdBaseRows instantly in memory.
+  // Anything that changes the key re-walks after the normal fd debounce.
+  property string lastFdKey: ""
+  property var fdBaseRows: []
   property bool previewIsImage: false
   property bool previewIsVideo: false
   property string previewSource: ""
@@ -124,6 +131,10 @@ Item {
     // The PDF cache stays too: its entries are self-contained data URLs that
     // reference no disk state, so they cannot go stale across sessions.
     root.searchResults = []
+    // The warm baseline lives only in memory, so a fresh session always
+    // starts with a real walk on its first flag query.
+    root.lastFdKey = ""
+    root.fdBaseRows = []
   }
 
   function toggle() {
@@ -247,8 +258,13 @@ Item {
     fdProc.queuedStart = false
     var parsed = FinderModel.parseQuery(root.filterText.trim())
     if (!root.opened || parsed.args.length === 0 || !parsed.fdPattern) return
+    // Stamp what actually launches; only a finished run promotes this to
+    // lastFdKey, so typing during the walk can never poison the warm path.
+    fdProc.pendingKey = FinderModel.fdCacheKey(root.cfg, parsed)
     fdProc.revision = root.fdSerial
-    fdProc.command = FinderModel.liveFdCommand(root.cfg, parsed, root.cfg.maxDisplayRows)
+    // The walk itself is uncapped by display size — its output is the whole
+    // baseline the warm path filters against.
+    fdProc.command = FinderModel.liveFdCommand(root.cfg, parsed, root.cfg.maxScanResults)
     fdProc.running = true
   }
 
@@ -300,6 +316,20 @@ Item {
     resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
   }
 
+  // Staged text of the current flag query, if it is one; "" otherwise.
+  function fdStagedText() {
+    var p = FinderModel.parseQuery(root.filterText.trim())
+    return (p.args.length > 0 && p.fdPattern) ? String(p.fzfQuery || "") : ""
+  }
+
+  // Displays the baseline filtered by the current staged text. Warm path:
+  // same-key keystrokes land here with zero latency and never clear rows.
+  function refreshFlagDisplay() {
+    root.searchResults = FinderModel.fuzzyFilterRows(root.fdBaseRows, fdStagedText())
+      .slice(0, root.cfg.maxDisplayRows)
+    root.rebuildDisplay()
+  }
+
   function setFilter(nextFilter) {
     root.filterText = nextFilter
     root.selectedIndex = 0
@@ -311,11 +341,25 @@ Item {
     searchDebounce.stop()
     fdDebounce.stop()
     var parsed = FinderModel.parseQuery(nextFilter)
+    // Leaving flag mode (empty query -> browse, or flags-only clearing)
+    // replaces the rows on screen with something else, so no completed run
+    // may serve as a warm baseline afterwards.
+    if (parsed.args.length === 0 || !parsed.fdPattern) {
+      root.lastFdKey = ""
+      root.fdBaseRows = []
+    }
     if (parsed.args.length > 0) {
       if (!parsed.fdPattern) {
         // Flags-only: nothing to run, clear immediately for feedback.
         root.searchResults = []
         root.rebuildDisplay()
+        return
+      }
+      // Same walk as the completed run on screen: refilter the baseline in
+      // memory — instant whether words are added or removed, no clearing.
+      var key = FinderModel.fdCacheKey(root.cfg, parsed)
+      if (key !== "" && key === root.lastFdKey) {
+        refreshFlagDisplay()
         return
       }
       // Flag mode walks real trees: a slower debounce keeps the churn down.
@@ -640,12 +684,22 @@ Item {
     id: fdProc
     property int revision: -1
     property bool queuedStart: false
+    property string pendingKey: ""
     onExited: root.startFdSearch()
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         if (fdProc.revision !== root.fdSerial) return
-        root.applyPathLines(text)
+        // Baseline = every line of the capped walk; what's DISPLAYED is the
+        // baseline filtered by whatever the staged text is right now.
+        var rows = []
+        var lines = String(text).split("\n")
+        for (var i = 0; i < lines.length; i++) {
+          if (lines[i].length > 1 && lines[i].charAt(0) === "/") rows.push(lines[i])
+        }
+        root.lastFdKey = fdProc.pendingKey
+        root.fdBaseRows = rows
+        root.refreshFlagDisplay()
       }
     }
   }

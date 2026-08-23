@@ -47,6 +47,10 @@ eq(M.resolveSettings({ ignored_dirs: ["$HOME"] }, HOME).searchDirs, [], "root li
 eq(M.resolveSettings({ search_dirs: ["/data"], ignored_dirs: ["/database"] }, HOME).searchDirs, ["/data"], "prefix collision is not a match")
 eq(M.resolveSettings({ debounce_ms: 0 }, HOME).debounceMs, 0, "zero debounce allowed")
 eq(M.resolveSettings({ max_display_rows: "abc" }, HOME).maxDisplayRows, M.maxDisplayRows, "garbage int falls back")
+eq(M.resolveSettings({}, HOME).previewWorkers, 3, "default worker count is 3")
+eq(M.resolveSettings({ preview_workers: 10 }, HOME).previewWorkers, 3, "worker count clamps to 3")
+eq(M.resolveSettings({ preview_workers: 1 }, HOME).previewWorkers, 1, "one worker means serial previews")
+eq(M.resolveSettings({ preview_workers: 0 }, HOME).previewWorkers, M.previewWorkers, "invalid worker count falls back")
 
 // ================= expandPath =================
 
@@ -201,8 +205,18 @@ eq(parse("--size +5mb invoice"), { args: ["--size", "+5mb"], fdPattern: "invoice
   "value flag + single text")
 eq(parse("--size=+5mb report paid 2024"), { args: ["--size=+5mb"], fdPattern: "report", fzfQuery: "paid 2024" },
   "attached value; extra text staged to fzf")
-eq(parse("-e jpg png -- sunset beach"), { args: ["-e", "jpg", "png"], fdPattern: "sunset", fzfQuery: "beach" },
-  "variadic ends at bare --")
+eq(parse("-e pdf ."), { args: ["-e", "pdf"], fdPattern: ".", fzfQuery: "" },
+  "single-value extension + match-all pattern")
+eq(parse("--ext pdf ."), { args: ["--extension", "pdf"], fdPattern: ".", fzfQuery: "" },
+  "--ext alias rewrites to --extension and consumes one value")
+eq(parse("--ext=pdf ."), { args: ["--extension=pdf"], fdPattern: ".", fzfQuery: "" },
+  "attached --ext= form also rewrites")
+eq(parse("--ext jpg --ext png report"), { args: ["--extension", "jpg", "--extension", "png"], fdPattern: "report", fzfQuery: "" },
+  "repeated --ext aliases")
+eq(parse("-e jpg -e png -- sunset beach"), { args: ["-e", "jpg", "-e", "png"], fdPattern: "sunset", fzfQuery: "beach" },
+  "repeated extensions; bare -- stages the rest to fzf")
+eq(parse("-E node_modules report"), { args: ["-E", "node_modules"], fdPattern: "report", fzfQuery: "" },
+  "exclude takes one glob; text becomes pattern")
 eq(parse("--size +5mb"), { args: ["--size", "+5mb"], fdPattern: "", fzfQuery: "" }, "flags-only -> no run")
 eq(parse("-- -weird x"), { args: [], fdPattern: "-weird", fzfQuery: "x" }, "bare -- makes everything literal")
 eq(parse("--hidden foo bar baz"), { args: ["--hidden"], fdPattern: "foo", fzfQuery: "bar baz" },
@@ -213,17 +227,57 @@ eq(parse("--changed-within 1d ."), { args: ["--changed-within", "1d"], fdPattern
   "match-all wildcard token")
 eq(parse("-"), { args: [], fdPattern: "-", fzfQuery: "" }, "lone dash is text, not a flag")
 
+// ================= fdCacheKey / warm-edit path =================
+
+var keyCfg = M.resolveSettings({ search_dirs: ["/r1"] }, HOME)
+eq(M.fdCacheKey(keyCfg, parse("--size +5mb big rest")),
+   M.fdCacheKey(keyCfg, parse("--size +5mb big rest more words")),
+   "cache key ignores staged fzf text")
+ok(M.fdCacheKey(keyCfg, parse("--size +5mb big")) !== M.fdCacheKey(keyCfg, parse("--size +5mb other")),
+   "cache key tracks the pattern")
+ok(M.fdCacheKey(keyCfg, parse("--size +5mb big")) !== M.fdCacheKey(keyCfg, parse("--type f big")),
+   "cache key tracks the flags")
+ok(M.fdCacheKey(keyCfg, parse("--size +5mb big"))
+   !== M.fdCacheKey(M.resolveSettings({ search_dirs: ["/other"] }, HOME), parse("--size +5mb big")),
+   "cache key tracks walk-relevant settings")
+eq(M.fdCacheKey(keyCfg, parse("big rest")), "", "classic queries never produce a key")
+eq(M.fdCacheKey(keyCfg, parse("--size +5mb")), "", "flags-only queries never produce a key")
+
+// ================= fuzzyFilterRows =================
+
+var rows = ["/a/report.txt", "/b/Report Paid.pdf", "/c/rep.xlsx", "/d/paid-report.doc"]
+eq(M.fuzzyFilterRows([], "x"), [], "empty input stays empty")
+eq(M.fuzzyFilterRows(rows, ""), rows.slice(), "blank query passes everything through in order")
+eq(M.fuzzyFilterRows(rows, "   "), rows.slice(), "whitespace query passes through")
+ok(M.fuzzyFilterRows(rows, "report").indexOf("/a/report.txt") === 0,
+   "contiguous anchored match ranks first; case-folded")
+eq(M.fuzzyFilterRows(rows, "rep").length, 4, "subsequence matches mid-word too")
+eq(M.fuzzyFilterRows(rows, "Report"), ["/b/Report Paid.pdf"], "uppercase query turns case-sensitive")
+eq(M.fuzzyFilterRows(rows, "zzz"), [], "non-subsequence matches nothing")
+eq(M.fuzzyFilterRows(rows, "rep paid").sort(),
+   ["/b/Report Paid.pdf", "/d/paid-report.doc"].sort(),
+   "space-separated terms AND independently like real fzf")
+eq(M.fuzzyFilterRows(["/y/xrep xpaid.doc", "/x/rep paid.txt"], "rep paid"),
+   ["/x/rep paid.txt", "/y/xrep xpaid.doc"],
+   "both terms contiguous+anchored outranks scattered matches")
+eq(M.fuzzyFilterRows(["/b/xreport.txt", "/a/report.txt"], "report"),
+   ["/a/report.txt", "/b/xreport.txt"],
+   "path-boundary anchored match outranks mid-word match")
+eq(M.fuzzyFilterRows(["/b/scatter-r-e-p-o-rt.doc", "/a/report.txt"], "report"),
+   ["/a/report.txt", "/b/scatter-r-e-p-o-rt.doc"],
+   "multi-start alignment finds the clean run, not the greedy scattered one")
+
 // ================= liveFdCommand =================
 
 var liveCfg = M.resolveSettings({ search_dirs: ["/r1", "/r2"], ignored_dirs: ["/r2/deep/x"] }, HOME)
-var lf = M.liveFdCommand(liveCfg, parse("--size +5mb big rest"), 50)[2]
+var lf = M.liveFdCommand(liveCfg, parse("--size +5mb big rest"), 5000)[2]
 eq(fdInvocationCount(lf), 1, "live fd is ONE invocation")
 ok(lf.indexOf("'--size' '+5mb'") !== -1, "user flags verbatim and quoted")
 ok(lf.indexOf("'--absolute-path'") !== -1, "absolute path forced")
 ok(lf.indexOf("'--exclude' '**/deep/x'") !== -1, "policy excludes enforced in flag mode")
 ok(lf.indexOf("'big' \"${__p[@]}\"") !== -1, "pattern quoted before guarded roots")
-ok(lf.indexOf("| fzf --filter 'rest' --scheme=path") !== -1, "second text stage goes through fzf")
-ok(lf.trim().endsWith("| head -n 50"), "live results capped")
+eq(lf.indexOf("fzf"), -1, "walk carries NO fzf stage — staged text filters in memory")
+ok(lf.trim().endsWith("| head -n 5000"), "baseline capped at the passed walk cap")
 ok(/wait "\$__p"/.test(lf), "live leaf relay-wrapped")
 
 lf = M.liveFdCommand(liveCfg, parse("-e txt ."), 50)[2]
@@ -288,6 +342,7 @@ ok(M.liveFdCommand(liveCfg, parse("--size +5mb"), 50)[2].indexOf("'.' \"${__p[@]
   fs.writeFileSync(path.join(root, "big.txt"), Buffer.alloc(2048, "a"))
   fs.writeFileSync(path.join(root, "small.txt"), Buffer.alloc(200, "s"))
   fs.writeFileSync(path.join(root, "pic.jpg"), Buffer.alloc(2048, "j"))
+  fs.writeFileSync(path.join(root, "doc.pdf"), "%PDF-1.4 fake")
   fs.writeFileSync(path.join(root, "sub", "deep.txt"), Buffer.alloc(3072, "d"))
 
   var cfg = M.resolveSettings({ search_dirs: [root] }, HOME)
@@ -305,8 +360,20 @@ ok(M.liveFdCommand(liveCfg, parse("--size +5mb"), 50)[2].indexOf("'.' \"${__p[@]
     "live: match-all over roots")
   // extension via variadic ended by bare --, then single text token
   eq(runLive("-e jpg -- pic"), [path.join(root, "pic.jpg")], "live: extension filter")
-  // staged filtering: fd narrows, fzf ranks the remainder
-  eq(runLive("--type f . big"), [path.join(root, "big.txt")], "live: fzf stage filters fd output")
+  // single-value extension + match-all, like fd's own CLI
+  eq(runLive("-e pdf ."), [path.join(root, "doc.pdf")], "live: -e pdf . match-all")
+  eq(runLive("--ext pdf ."), [path.join(root, "doc.pdf")], "live: --ext alias reaches fd as --extension")
+  eq(runLive("-e jpg -e pdf .").sort(),
+    [path.join(root, "pic.jpg"), path.join(root, "doc.pdf")].sort(),
+    "live: repeated extensions")
+  // staged text never reaches the command: the baseline keeps every walk
+  // row, and the finder filters it in memory (fuzzyFilterRows unit-tested above)
+  var base = runLive("--type f . big")
+  eq(base.length, 5, "live: baseline returns the whole walk, staged text ignored")
+  // score root-relative paths so the random tmpdir name can't interfere
+  var rel = base.map(function (p) { return p.slice(root.length) })
+  eq(M.fuzzyFilterRows(rel, "big"), ["/big.txt"],
+     "live: staged word filters the baseline client-side")
   // unknown/broken flag -> silent empty result
   eq(runLive("--frobnicate x"), [], "live: broken flag yields silence")
 
