@@ -37,6 +37,8 @@ Item {
   property var previewCacheKeys: []
   // Rendered first pages live at a fixed path; pdfCache remembers which
   // document each render belongs to so revisits skip pdftoppm entirely.
+  // Cleared whenever the overlay closes — close() removes the render file,
+  // so stale entries would otherwise point at a missing image forever.
   readonly property string pdfPngBase: home + "/.local/state/omarchy/file-finder-pdf"
   readonly property string pdfPngPath: pdfPngBase + ".png"
   property var pdfCache: ({})
@@ -99,8 +101,9 @@ Item {
     root.cursorActive = true
     root.disarmPointer()
     root.clearPreview()
-    // Preview and PDF caches persist across toggles for the whole shell
-    // session, so revisiting a file re-shows its preview instantly.
+    // The preview cache persists across toggles for the whole shell
+    // session, so revisiting a file re-shows its preview instantly. (The
+    // PDF render cache resets on close; see close().)
     root.rebuildDisplay()
     root.refreshScan()
     searchDebounce.restart()
@@ -118,6 +121,10 @@ Item {
     previewDebounce.stop()
     root.cancelPendingWork()
     root.clearPreview()
+    // Last session's rows must not flash under the empty filter on reopen,
+    // and pdfCache entries would point at the render file removed below.
+    root.searchResults = []
+    root.pdfCache = {}
     Util.execDetached("rm -f " + Util.shellQuote(root.pdfPngPath))
   }
 
@@ -130,9 +137,11 @@ Item {
   // fully exits, so a fresh run requested mid-teardown queues itself and
   // starts from onExited instead of being silently dropped.
   function refreshScan() {
-    var now = Date.now()
-    if (!scanProc.running && !root.scanQueued && root.lastScanFinishedAt
-        && now - root.lastScanFinishedAt < root.cfg.rescanIntervalMs) {
+    // A scan already in flight (or queued behind a teardown) will land on
+    // its own — restarting it would only discard nearly-fresh work.
+    if (scanProc.running || root.scanQueued) return
+    if (root.lastScanFinishedAt
+        && Date.now() - root.lastScanFinishedAt < root.cfg.rescanIntervalMs) {
       // The index was rebuilt moments ago — skip the churn and keep serving
       // the existing list; the next open past the interval rescans.
       return
@@ -141,8 +150,7 @@ Item {
     scanProc.revision = root.scanSerial
     root.scanning = true
     root.scanQueued = true
-    if (!scanProc.running) startScan()
-    else scanProc.running = false
+    startScan()
   }
 
   function startScan() {
@@ -287,9 +295,15 @@ Item {
 
   function killPreviewWorkers() {
     for (var i = 0; i < previewPool.length; i++) {
-      if (previewPool[i].running) {
-        previewPool[i].cancelled = true
-        previewPool[i].running = false
+      var worker = previewPool[i]
+      if (worker.running) {
+        worker.cancelled = true
+        worker.cooldown = true
+        worker.running = false
+      } else {
+        // Not running: a parked job here can never be pumped (no pending
+        // onExited), so drop it instead of leaking a phantom-busy slot.
+        worker.queuedStart = false
       }
     }
   }
@@ -331,7 +345,18 @@ Item {
   }
 
   function cachedPreview(path) {
-    return root.previewCache[path] || null
+    var hit = root.previewCache[path] || null
+    if (hit) root.touchPreviewCache(path)
+    return hit
+  }
+
+  // Moves a key to the tail on hit so eviction follows real recency (LRU).
+  function touchPreviewCache(path) {
+    var keys = root.previewCacheKeys
+    var idx = keys.indexOf(path)
+    if (idx < 0 || idx === keys.length - 1) return
+    keys.splice(idx, 1)
+    keys.push(path)
   }
 
   function storePreviewInCache(path, meta, content) {
@@ -487,7 +512,7 @@ Item {
         var lines = String(text || "").split("\n")
         for (var i = 0; i < lines.length; i++) {
           var line = lines[i]
-          if (line.length > 4 && line.indexOf("/") === 0) rows.push(line)
+          if (line.length > 1 && line.indexOf("/") === 0) rows.push(line)
         }
         root.searchResults = rows
         root.rebuildDisplay()
@@ -508,7 +533,7 @@ Item {
         var lines = String(text || "").split("\n")
         for (var i = 0; i < lines.length && rows.length < root.cfg.maxDisplayRows; i++) {
           var line = lines[i]
-          if (line.length > 4 && line.indexOf("/") === 0) rows.push(line)
+          if (line.length > 1 && line.indexOf("/") === 0) rows.push(line)
         }
         root.searchResults = rows
         root.rebuildDisplay()
@@ -527,7 +552,9 @@ Item {
   // while the selected row is still being read. Results are keyed by path,
   // so a killed stale worker's partial output can only ever populate the
   // cache for its own file — display updates additionally require the
-  // worker's row to still be selected.
+  // worker's row to still be selected. Dispatches queue through onExited
+  // (like searchProc) so a job aimed at a mid-teardown worker is never
+  // silently dropped.
   Component {
     id: previewWorkerComp
 
@@ -539,6 +566,19 @@ Item {
       // Set when the worker is killed mid-run so its truncated output can
       // never populate the cache.
       property bool cancelled: false
+      // A Process ignores `running = true` until it fully exits, so a fresh
+      // job requested mid-teardown parks here and starts from onExited.
+      property bool queuedStart: false
+      // Must stay a var: the command is an argv array, and a string-typed
+      // property would coerce it into one mangled token no binary matches.
+      property var jobCommand: null
+      // True from kill until the process has fully exited; idle selection
+      // skips cooled-down workers so a start can never land mid-teardown.
+      property bool cooldown: false
+      onExited: {
+        worker.cooldown = false
+        root.pumpPreviewWorker(worker)
+      }
       stdout: StdioCollector {
         waitForEnd: true
         onStreamFinished: root.finishPreview(worker, text)
@@ -556,9 +596,11 @@ Item {
     }
   }
 
+  // Idle = fully exited, not holding a queued job, and not cooling down.
   function idlePreviewWorker() {
     for (var i = 0; i < previewPool.length; i++) {
-      if (!previewPool[i].running) return previewPool[i]
+      var worker = previewPool[i]
+      if (!worker.running && !worker.queuedStart && !worker.cooldown) return worker
     }
     return null
   }
@@ -575,7 +617,19 @@ Item {
     worker.currentPath = cachePath
     worker.displayKey = forKey
     worker.cancelled = false
-    worker.command = command
+    worker.jobCommand = command
+    worker.queuedStart = true
+    root.pumpPreviewWorker(worker)
+  }
+
+  // Starts a queued job on a fully-exited worker. Jobs parked while the
+  // worker was mid-teardown are pumped from onExited instead of being
+  // silently dropped.
+  function pumpPreviewWorker(worker) {
+    if (!worker.queuedStart || worker.running || worker.cooldown) return
+    worker.queuedStart = false
+    if (!root.opened || worker.cancelled) return
+    worker.command = worker.jobCommand
     worker.running = true
   }
 
@@ -843,7 +897,7 @@ Item {
             visible: !root.filterText && (root.scanning || root.fileListCount > 0)
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            text: root.scanning ? "scanning…" : root.fileListCount.toLocaleString() + " files"
+            text: root.scanning ? "scanning…" : root.fileListCount.toLocaleString() + " entries"
             color: root.foreground
             opacity: 0.5
             font.family: root.fontFamily
@@ -1036,7 +1090,7 @@ Item {
             Text {
               text: root.scanning && root.fileListCount === 0
                 ? "Scanning files…"
-                : (!root.filterText.trim() ? "~/Downloads is empty" : "No matches for “" + root.filterText + "”")
+                : (!root.filterText.trim() ? FinderModel.shortenPath(root.browseDir, root.home) + " is empty" : "No matches for “" + root.filterText + "”")
               color: root.foreground
               opacity: 0.7
               font.family: root.fontFamily

@@ -110,12 +110,20 @@ function resolveBrowseDir(settings, home) {
 // safe to call with {} or null.
 function resolveSettings(settings, home) {
   var rawFd = asStringArray(setting(settings, "fd_flags", []))
+  var ignoredDirs = expandPaths(asStringArray(setting(settings, "ignored_dirs", [])), home)
+  var dirs = searchDirs(settings, home)
+  // A root listed in ignored_dirs opts its whole subtree out: drop the root
+  // up front instead of emitting a meaningless "-E /" native exclude.
+  var effectiveDirs = []
+  for (var i = 0; i < dirs.length; i++) {
+    if (ignoredDirs.indexOf(dirs[i]) === -1) effectiveDirs.push(dirs[i])
+  }
   return {
-    searchDirs: searchDirs(settings, home),
+    searchDirs: effectiveDirs,
     // Names prune as unanchored excludes (any depth); dirs as anchored
     // per-root excludes (see fdExcludeArgs).
     ignoreNames: builtinIgnoreNames.concat(ignoredNames(settings)),
-    ignoredDirs: expandPaths(asStringArray(setting(settings, "ignored_dirs", [])), home),
+    ignoredDirs: ignoredDirs,
     maxScanResults: positiveInt(settings, "max_scan_results", maxScanResults),
     maxDisplayRows: positiveInt(settings, "max_display_rows", maxDisplayRows),
     maxBrowseRows: positiveInt(settings, "max_browse_rows", maxBrowseRows),
@@ -151,7 +159,9 @@ function fdExcludeArgs(root, ignoreNames, ignoredDirs) {
     if (!dir) continue
     if (dir === root || dir.indexOf(root + "/") === 0) {
       var rel = dir.slice(root.length).replace(/^\/+/, "")
-      args.push("-E", "/" + rel)
+      // Empty rel means the root itself is ignored — resolveSettings drops
+      // such roots; never emit a bare "-E /" here.
+      if (rel) args.push("-E", "/" + rel)
     }
   }
   return args
@@ -165,6 +175,7 @@ function quotedExcludeSegment(root, cfg) {
 // excludes (ignored_dirs/ignored_names) are enforced in BOTH modes by being
 // part of every fd invocation — user flags stay literal for everything else.
 function scanCommand(cfg) {
+  if (!cfg || !cfg.searchDirs || cfg.searchDirs.length === 0) return ["bash", "-c", ""]
   if (cfg && cfg.fdOverrideArgs) {
     var args = shellJoin(cfg.fdOverrideArgs)
     var blocks = []
@@ -203,7 +214,7 @@ function setting(settings, name, fallback) {
 function expandPath(path, home) {
   var value = String(path || "").trim()
   if (!value) return ""
-  if (value.indexOf("$HOME") === 0) value = home + value.substring(5)
+  if (value.indexOf("$HOME") === 0 && (value.length === 5 || value.charAt(5) === "/")) value = home + value.substring(5)
   else if (value.indexOf("~") === 0 && (value.length === 1 || value.charAt(1) === "/")) value = home + value.substring(1)
   while (value.length > 1 && value.charAt(value.length - 1) === "/") value = value.slice(0, -1)
   return value
@@ -288,7 +299,7 @@ function markDirectories(raw) {
     var files = chunks[0].split("\n")
     var dirs = chunks.length > 1 ? chunks[1].split("\n") : []
     for (var f = 0; f < files.length; f++) {
-      if (files[f].length > 4 && files[f].indexOf("/") === 0) out.push(files[f])
+      if (files[f].length > 1 && files[f].indexOf("/") === 0) out.push(files[f])
     }
     for (var d = 0; d < dirs.length; d++) {
       var line = dirs[d]
@@ -313,8 +324,12 @@ function browseCommandClassic(cfg) {
   if (ex) flags += ex + " "
   return ["bash", "-c",
     "{ [ -d " + shellQuote(dir) + " ] || exit 0 ; } ; "
-    + "( fd " + flags + "--type directory --absolute-path --min-depth 1 --max-depth 1 . " + shellQuote(dir) + " 2>/dev/null | sed 's|[^/]$|&/|'"
-    + " ; fd " + flags + "--type file --absolute-path --min-depth 1 --max-depth 1 . " + shellQuote(dir) + " 2>/dev/null )"
+    + "( "
+    + termRelay("fd " + flags + "--type directory --absolute-path --min-depth 1 --max-depth 1 . " + shellQuote(dir) + " 2>/dev/null")
+    + " | sed 's|[^/]$|&/|'"
+    + " ; "
+    + termRelay("fd " + flags + "--type file --absolute-path --min-depth 1 --max-depth 1 . " + shellQuote(dir) + " 2>/dev/null")
+    + " )"
     + " | head -n " + cfg.maxBrowseRows
   ]
 }
@@ -419,21 +434,25 @@ function isVideoPath(path) {
   return /\.(mp4|mkv|webm|mov|avi|m4v|mpg|mpeg|wmv|flv|m2ts|ts|3gp|ogv)$/i.test(String(path || ""))
 }
 
-// Renders page 1 of a PDF to <outBase>.png and reports "\t<size>\t<pages>"
-// so the caller can label the thumbnail without a second process. pdftoppm
-// writes straight to a file rather than the pipe, so it is the one stage
-// that must be relay-wrapped to die on stale-process teardown.
+// Renders page 1 of a PDF to <outBase>.png and reports "\t<size>\t" so the
+// caller can label the thumbnail. pdftoppm writes straight to a file rather
+// than the pipe, so it is relay-wrapped to die on stale-process teardown,
+// and the header is only printed after checking that a non-empty PNG
+// actually landed: a corrupt or unreadable document reports size -1 instead
+// of being cached as successfully rendered.
 function buildPdfPreviewCommand(path, outBase, scale) {
   if (scale === undefined) scale = pdfRenderScale
   var quoted = shellQuote(path)
+  var pngQuoted = shellQuote(outBase + ".png")
   var render = termRelay("pdftoppm -png -f 1 -singlefile -scale-to " + scale + " " + quoted + " " + shellQuote(outBase))
   return [
     "bash", "-c",
     "if [ -f " + quoted + " ] && [ -r " + quoted + " ]; then"
     + " sz=$(stat -Lc %s -- " + quoted + " 2>/dev/null);"
-    + " pg=$(pdfinfo " + quoted + " 2>/dev/null | awk '/^Pages:/ {print $2}');"
-    + ' printf "\\t%s\\t%s\\n" "${sz:-?}" "$pg";'
     + " " + render + ";"
+    + " if [ -s " + pngQuoted + " ]; then"
+    + ' printf "\\t%s\\t\\n" "${sz:-?}";'
+    + " else printf '\\t-1\\t\\n'; fi"
     + " else printf '\\t-1\\t\\n'; fi"
   ]
 }

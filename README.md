@@ -128,7 +128,12 @@ not followed (`--follow` to relax).
   loads into memory at shell start so first searches are instant, and
   refreshes in the background.
 - Preview and PDF caches persist across open/close toggles for the whole
-  shell session; revisiting a file re-shows its preview instantly.
+  shell session; revisiting a file re-shows its preview instantly. The
+  PDF render cache is the exception: it resets when the finder closes
+  (its thumbnail file is removed on close), so a PDF is re-rendered once
+  per open rather than kept for the session.
+- A search root listed in `ignored_dirs` is skipped entirely — the whole
+  subtree stays out of the index.
 - Stale work stops eagerly: every keystroke kills superseded search,
   browse, and preview processes instead of letting them run invisibly.
 
