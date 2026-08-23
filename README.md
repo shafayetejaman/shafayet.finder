@@ -127,6 +127,13 @@ not followed (`--follow` to relax).
 - The path index lives at `~/.local/state/omarchy/file-finder-list.txt`,
   loads into memory at shell start so first searches are instant, and
   refreshes in the background.
+- Each rescan is ONE relay-wrapped `fd` walk over every live search root;
+  dead roots are skipped automatically. Directories carry fd's trailing
+  `/` marker through to the UI.
+- With multiple scanned roots, `ignored_dirs` translates to cross-root
+  `**/<suffix>` excludes (fd prunes matching subtrees under any root), and
+  nested/overlapping `search_dirs` can list a subtree more than once —
+  same as listing it in several roots by hand.
 - Preview and PDF caches persist across open/close toggles for the whole
   shell session; revisiting a file re-shows its preview instantly. The
   PDF render cache is the exception: it resets when the finder closes

@@ -142,17 +142,16 @@ function resolveSettings(settings, home) {
   }
 }
 
-// Native fd excludes for one search root: names match any component at any
-// depth; configured dirs translate to gitignore-style anchored globs so
-// "/home/x/.cache" only ever prunes that exact subtree — a same-named
-// directory elsewhere in the tree stays indexed. Pairs outside the root are
-// skipped (fd would never descend there anyway). Excluding before traversal
-// lets fd skip whole subtrees instead of emitting lines for grep to discard.
+// Native fd excludes for one search root — used by the single-directory
+// browse command where per-root anchoring is still exact. Names match any
+// component at any depth; configured dirs translate to gitignore-style
+// anchored globs so "/home/x/.cache" only ever prunes that exact subtree.
+// Pairs outside the root are skipped (fd would never descend there anyway).
 function fdExcludeArgs(root, ignoreNames, ignoredDirs) {
   var args = []
   var i
   for (i = 0; i < ignoreNames.length; i++) {
-    if (ignoreNames[i]) args.push("-E", String(ignoreNames[i]))
+    if (ignoreNames[i]) args.push("--exclude", String(ignoreNames[i]))
   }
   for (i = 0; i < ignoredDirs.length; i++) {
     var dir = String(ignoredDirs[i] || "")
@@ -160,8 +159,8 @@ function fdExcludeArgs(root, ignoreNames, ignoredDirs) {
     if (dir === root || dir.indexOf(root + "/") === 0) {
       var rel = dir.slice(root.length).replace(/^\/+/, "")
       // Empty rel means the root itself is ignored — resolveSettings drops
-      // such roots; never emit a bare "-E /" here.
-      if (rel) args.push("-E", "/" + rel)
+      // such roots; never emit a bare "--exclude /" here.
+      if (rel) args.push("--exclude", "/" + rel)
     }
   }
   return args
@@ -171,23 +170,77 @@ function quotedExcludeSegment(root, cfg) {
   return shellJoin(fdExcludeArgs(root, cfg.ignoreNames, cfg.ignoredDirs)).join(" ")
 }
 
+// Policy excludes for ONE combined fd invocation spanning every search
+// root. Empirically (fd 10): slash-less globs prune that name at any depth
+// under all start dirs, and a "**/a/b" glob extends the same cross-root
+// reach to nested paths — slash-anchored patterns would only ever see the
+// first positional root. So names pass through verbatim and each ignored
+// dir becomes "**/<rel>", with rel taken from its deepest matching root.
+function combinedExcludeArgs(ignoreNames, ignoredDirs, searchDirs) {
+  var args = []
+  var seen = {}
+  var i
+  for (i = 0; i < ignoreNames.length; i++) {
+    var name = String(ignoreNames[i] || "")
+    if (!name || seen[name]) continue
+    seen[name] = true
+    args.push("--exclude", name)
+  }
+  for (i = 0; i < ignoredDirs.length; i++) {
+    var dir = String(ignoredDirs[i] || "")
+    if (!dir || seen[dir]) continue
+    var rel = relativeToDeepestRoot(dir, searchDirs)
+    if (!rel) continue
+    seen[dir] = true
+    args.push("--exclude", "**/" + rel)
+  }
+  return args
+}
+
+// Longest "dir sits below this root" suffix, or "" when no scanned root
+// contains it (fd would never descend there anyway).
+function relativeToDeepestRoot(dir, searchDirs) {
+  var best = ""
+  for (var i = 0; i < searchDirs.length; i++) {
+    var root = String(searchDirs[i] || "")
+    if (dir.indexOf(root + "/") !== 0) continue
+    var rel = dir.slice(root.length).replace(/^\/+/, "")
+    if (rel && rel.length > best.length) best = rel
+  }
+  return best
+}
+
+function combinedExcludeSegment(cfg) {
+  return shellJoin(combinedExcludeArgs(cfg.ignoreNames, cfg.ignoredDirs, cfg.searchDirs)).join(" ")
+}
+
+// Bash prologue collecting live roots into __p[], so one dead mount or
+// vanished directory cannot fail the whole walk.
+function guardedRootsSnippet(searchDirs) {
+  var parts = ["__p=()"]
+  for (var i = 0; i < searchDirs.length; i++) {
+    var quoted = shellQuote(searchDirs[i])
+    parts.push("[ -d " + quoted + " ] && __p+=(" + quoted + ")")
+  }
+  parts.push("[ ${#__p[@]} -gt 0 ] || exit 0")
+  return parts.join(" ; ")
+}
+
 // Entry points used by QML: dispatch on whether fd_flags overrides. Policy
 // excludes (ignored_dirs/ignored_names) are enforced in BOTH modes by being
 // part of every fd invocation — user flags stay literal for everything else.
+// Both modes walk all search roots in ONE relay-wrapped fd invocation with
+// guarded positionals; fd prints directories with a trailing "/" so the
+// output needs no framing or post-classification.
 function scanCommand(cfg) {
   if (!cfg || !cfg.searchDirs || cfg.searchDirs.length === 0) return ["bash", "-c", ""]
   if (cfg && cfg.fdOverrideArgs) {
-    var args = shellJoin(cfg.fdOverrideArgs)
-    var blocks = []
-    for (var i = 0; i < cfg.searchDirs.length; i++) {
-      var root = cfg.searchDirs[i]
-      var ex = quotedExcludeSegment(root, cfg)
-      var fdCmd = "fd " + args.join(" ") + (ex ? " " + ex : "") + " . " + shellQuote(root)
-      blocks.push("( " + termRelay(fdCmd + " 2>/dev/null") + " | " + fdClassifySnippet(false)
-        + " ; printf '\\n" + scanBlockMarker + "\\n' ) 2>/dev/null")
-    }
+    var argStr = shellJoin(cfg.fdOverrideArgs).join(" ")
+    var ex = combinedExcludeSegment(cfg)
     return ["bash", "-c",
-      "( " + blocks.join(" ; ") + " ) 2>/dev/null | head -n " + cfg.maxScanResults]
+      "( { " + guardedRootsSnippet(cfg.searchDirs) + " ; "
+      + termRelay("fd " + argStr + (ex ? " " + ex : "") + " . \"${__p[@]}\" 2>/dev/null")
+      + " ; } 2>/dev/null ) | head -n " + cfg.maxScanResults]
   }
   return scanCommandClassic(cfg)
 }
@@ -264,72 +317,55 @@ function termRelay(cmd) {
 var scanSectionMarker = "@@DIRS@@"
 var scanBlockMarker = "@@END@@"
 
-// One fd pass per search dir for files and another for directories so a
-// missing directory cannot sink the others. Each pass is a relay-wrapped
-// leaf carrying this root's native excludes; the framed chunks are
-// re-joined by markDirectories() per directory with the trailing "/"
-// type marker applied in JS, where it survives fzf filtering.
+// One relay-wrapped fd walk over every live search root: files and
+// directories in a single pass, directories carrying their native trailing
+// "/" type marker (normalized by markDirectories). Dead roots are dropped
+// by the guard, and head truncation just severs the line stream — any
+// prefix of it is a valid index.
 function scanCommandClassic(cfg) {
-  var parts = []
-  for (var i = 0; i < cfg.searchDirs.length; i++) {
-    var root = cfg.searchDirs[i]
-    var flags = fdFlagSegment(cfg.fdFlags)
-    if (cfg.showHidden) flags += "--hidden "
-    var ex = quotedExcludeSegment(root, cfg)
-    if (ex) flags += ex + " "
-    parts.push("( "
-      + termRelay("fd " + flags + "--type file --absolute-path . " + shellQuote(root))
-      + " ; printf '\\n" + scanSectionMarker + "\\n' ; "
-      + termRelay("fd " + flags + "--type directory --absolute-path . " + shellQuote(root))
-      + " ; printf '\\n" + scanBlockMarker + "\\n' ) 2>/dev/null")
-  }
+  var flags = fdFlagSegment(cfg.fdFlags)
+  flags += "--type file --type directory "
+  if (cfg.showHidden) flags += "--hidden "
+  var ex = combinedExcludeSegment(cfg)
+  if (ex) flags += ex + " "
+  flags += "--absolute-path "
   return ["bash", "-c",
-    "( " + parts.join(" ; ") + " ) 2>/dev/null | head -n " + cfg.maxScanResults]
+    "( { " + guardedRootsSnippet(cfg.searchDirs) + " ; "
+    + termRelay("fd " + flags + ". \"${__p[@]}\" 2>/dev/null")
+    + " ; } 2>/dev/null ) | head -n " + cfg.maxScanResults]
 }
 
-// Re-joins framed scan blocks: each "files @@DIRS@@ dirs @@END@@" becomes
-// "files then dirs/" in original order, preserving the per-directory
-// grouping the old sed pipeline produced. Tolerates a severed tail (head -n
-// truncation) and empty chunks.
+// Collects absolute-path lines from a scan; directory rows keep fd's
+// trailing "/" marker, collapsed to exactly one. Marker lines from legacy
+// framed cache files never start with "/", so old indexes parse unchanged,
+// and any truncated tail is still a valid prefix.
 function markDirectories(raw) {
   var out = []
-  var blocks = String(raw || "").split(scanBlockMarker)
-  for (var b = 0; b < blocks.length; b++) {
-    var chunks = blocks[b].split(scanSectionMarker)
-    var files = chunks[0].split("\n")
-    var dirs = chunks.length > 1 ? chunks[1].split("\n") : []
-    for (var f = 0; f < files.length; f++) {
-      if (files[f].length > 1 && files[f].indexOf("/") === 0) out.push(files[f])
-    }
-    for (var d = 0; d < dirs.length; d++) {
-      var line = dirs[d]
-      if (line.length > 1 && line.indexOf("/") === 0) {
-        // fd emits directories with a trailing slash already; normalize any
-        // number of them to exactly one so display never sees "dir//".
-        line = line.replace(/\/+$/, "") + "/"
-        out.push(line)
-      }
-    }
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i]
+    if (line.length > 1 && line.charAt(0) === "/") out.push(line.replace(/\/{2,}$/, "/"))
   }
   return out
 }
 
 // Non-recursive snapshot of one directory, directories first. Shown when the
-// query is empty so the finder opens as a browser of ~/Downloads.
+// query is empty so the finder opens as a browser of ~/Downloads. A single
+// mixed-type fd pass feeds the classify snippet, which reorders dirs ahead
+// of files without trusting the walk order.
 function browseCommandClassic(cfg) {
   var dir = cfg.browseDir
+  var quoted = shellQuote(dir)
   var flags = fdFlagSegment(cfg.fdFlags)
   if (cfg.showHidden) flags += "--hidden "
   var ex = quotedExcludeSegment(dir, cfg)
   if (ex) flags += ex + " "
   return ["bash", "-c",
-    "{ [ -d " + shellQuote(dir) + " ] || exit 0 ; } ; "
+    "{ [ -d " + quoted + " ] || exit 0 ; } ; "
     + "( "
-    + termRelay("fd " + flags + "--type directory --absolute-path --min-depth 1 --max-depth 1 . " + shellQuote(dir) + " 2>/dev/null")
-    + " | sed 's|[^/]$|&/|'"
-    + " ; "
-    + termRelay("fd " + flags + "--type file --absolute-path --min-depth 1 --max-depth 1 . " + shellQuote(dir) + " 2>/dev/null")
-    + " )"
+    + termRelay("fd " + flags + "--type directory --type file --absolute-path --min-depth 1 --max-depth 1 . " + quoted + " 2>/dev/null")
+    + " | " + fdClassifySnippet(true)
+    + " ) 2>/dev/null"
     + " | head -n " + cfg.maxBrowseRows
   ]
 }
@@ -497,6 +533,10 @@ if (typeof module !== "undefined") {
     shellJoin: shellJoin,
     fdExcludeArgs: fdExcludeArgs,
     quotedExcludeSegment: quotedExcludeSegment,
+    combinedExcludeArgs: combinedExcludeArgs,
+    combinedExcludeSegment: combinedExcludeSegment,
+    relativeToDeepestRoot: relativeToDeepestRoot,
+    guardedRootsSnippet: guardedRootsSnippet,
     resolveBrowseDir: resolveBrowseDir,
     resolveSettings: resolveSettings,
     scanCommand: scanCommand,
