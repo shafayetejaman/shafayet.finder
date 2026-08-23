@@ -8,7 +8,31 @@ heads, directory listings, images, PDF first-page renders, and video frame grabs
 
 https://github.com/user-attachments/assets/c07ae865-26f7-41d2-b890-42eb8456685f
 
+## Install
 
+```bash
+omarchy plugin install https://github.com/shafayetejaman/shafayet.finder.git --enable
+```
+
+## Remove
+
+```bash
+omarchy plugin remove shafayet.finder
+```
+
+## Dependencies
+
+| Tool                                                        | Preinstalled with Omarchy | Needed for                        | Install if missing                  |
+| ----------------------------------------------------------- | ------------------------- | --------------------------------- | ----------------------------------- |
+| `fd`                                                        | Yes                       | Search index and flag-mode queries | `sudo pacman -S --needed fd`       |
+| `fzf`                                                       | Yes                       | Fuzzy ranking of results          | `sudo pacman -S --needed fzf`       |
+| [`poppler`](https://poppler.freedesktop.org/) (`pdftoppm`)  | No                        | PDF page thumbnails               | `sudo pacman -S --needed poppler`   |
+| `ffmpeg`                                                    | No                        | Video frame previews              | `sudo pacman -S --needed ffmpeg`    |
+| [`trash-cli`](https://github.com/andreafrancia/trash-cli)   | No                        | Delete-to-trash keybind           | `sudo pacman -S --needed trash-cli` |
+
+Optional tools degrade gracefully: without them the finder still works, minus
+that one feature (PDF/video previews report unavailable, trash key reports an
+error).
 
 ## Usage
 
