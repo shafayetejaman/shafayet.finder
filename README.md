@@ -1,0 +1,121 @@
+# File Finder (shafayet.finder)
+
+Fuzzy file finder overlay for the Omarchy shell with live previews: text
+heads, directory listings, images, and PDF first-page renders.
+
+## Usage
+
+Open the finder from your configured launcher binding. Keys:
+
+| Key | Action |
+| --- | --- |
+| printable chars | Type to filter |
+| `Esc` | Clear filter, then close |
+| `Up` / `Down`, `Ctrl+J` / `Ctrl+K` | Move selection |
+| `PageUp` / `PageDown` | Move by 6 rows |
+| `Home` / `End` | First / last row |
+| `Enter` | Open selection with `xdg-open` |
+| `Shift+Enter` | Copy path |
+| `Alt+Enter` | Reveal in file manager |
+
+With an empty query the finder browses a start directory (`~/Downloads`
+by default) instead of searching.
+
+## Configuration
+
+Every setting has a static default — the plugin works with no entry in
+`shell.json` at all. To override any subset, add an entry with this
+plugin's `id` to the `plugins` array in `~/.config/omarchy/shell.json`:
+
+```jsonc
+{
+  // ...
+  "plugins": [
+    {
+      "id": "shafayet.finder",
+      "search_dirs": ["$HOME", "/mnt/data"],
+      "ignored_dirs": ["$HOME/.cache", "$HOME/go/pkg"],
+      "ignored_names": ["target", ".venv", "dist"],
+      "browse_dir": "$HOME/Documents",
+      "max_scan_results": 100000,
+      "max_display_rows": 50,
+      "max_browse_rows": 200,
+      "preview_byte_limit": 65536,
+      "preview_cache_limit": 500,
+      "preview_workers": 3,
+      "debounce_ms": 120,
+      "pdf_render_scale": 1200,
+      "show_hidden": false,
+      "fd_flags": [
+        "--ignore-vcs",
+        "--hidden",
+        "--follow"
+      ]
+    }
+  ]
+}
+```
+
+Any key you omit keeps its default; unknown keys are ignored. Changes
+hot-reload when you save `shell.json`.
+
+### Keys
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `search_dirs` | string[] | `["$HOME"]` | Roots scanned into the search index. `$HOME` and leading `~` expand. |
+| `ignored_dirs` | string[] | `[]` | Paths whose subtree never enters the index. |
+| `ignored_names` | string[] | `[]` | Extra directory names to skip, merged with the built-ins (`node_modules`, `__pycache__`). |
+| `browse_dir` | string | `$HOME/Downloads` | Directory listed while the query is empty. |
+| `max_scan_results` | int | `100000` | Cap on indexed paths per scan. |
+| `max_display_rows` | int | `50` | Max rows shown for a query. |
+| `max_browse_rows` | int | `200` | Max rows shown in empty-query browse mode. |
+| `preview_byte_limit` | int | `65536` | Bytes of file content or directory listing loaded per preview. |
+| `preview_cache_limit` | int | `500` | LRU entries kept in memory across opens (per shell session). |
+| `preview_workers` | int | `3` | Concurrent preview processes; a slow PDF render never blocks text previews. |
+| `debounce_ms` | int | `120` | Delay between keystroke/selection and its search/preview launch. |
+| `pdf_render_scale` | int | `1200` | `-scale-to` value passed to `pdftoppm` for page thumbnails. |
+| `show_hidden` | bool | `false` | Skip dot files by default: hidden entries stay out of the index (fd's default) and out of directory previews; `true` adds `--hidden` to classic scans and shows everything. Note fd still surfaces dotfiles explicitly whitelisted in `.gitignore` (like `!.gitkeep`) regardless of this setting. |
+| `fd_flags` | string[] | *(unset)* | **Full override** of the flags given to every `fd` invocation — see below. |
+
+### fd_flags: override semantics
+
+When `fd_flags` is set to a non-empty list, it **replaces the entire flag
+set** the finder would otherwise use — your flags are passed to a single
+`fd` pass verbatim (type selectors included), per search root:
+
+```jsonc
+"fd_flags": ["--ignore-vcs", "--type", "file", "--type", "directory", "--hidden", "--follow"]
+```
+
+- The finder auto-appends `--absolute-path` if you omit it (the index
+  stores absolute paths; results would be unusable without it).
+- Flags must make `fd` print paths — avoid `--exec`, `-x`, or quiet modes.
+- Search roots/patterns stay builder-owned; don't pass positional paths.
+
+When `fd_flags` is unset **or empty**, the classic pipeline runs with this
+baseline, which you can reproduce explicitly:
+
+```jsonc
+"fd_flags": ["--type", "file", "--type", "directory", "--absolute-path"]
+```
+
+plus fd's own defaults on top: hidden entries skipped (unless
+`show_hidden`), VCS ignores respected (`--ignore-vcs` to relax), symlinks
+not followed (`--follow` to relax).
+
+## Behavior notes
+
+- The path index lives at `~/.local/state/omarchy/file-finder-list.txt`,
+  loads into memory at shell start so first searches are instant, and
+  refreshes in the background.
+- Preview and PDF caches persist across open/close toggles for the whole
+  shell session; revisiting a file re-shows its preview instantly.
+- Stale work stops eagerly: every keystroke kills superseded search,
+  browse, and preview processes instead of letting them run invisibly.
+
+## Files
+
+- `Finder.qml` — overlay UI, process lifecycle, preview worker pool
+- `FinderModel.js` — pure helpers: settings resolution, path display,
+  command builders (exercisable with `node`)

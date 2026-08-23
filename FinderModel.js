@@ -6,11 +6,169 @@ var maxScanResults = 100000
 var maxDisplayRows = 50
 var maxBrowseRows = 200
 var previewByteLimit = 65536
+var previewCacheLimit = 500
+var previewWorkers = 3
+var debounceMs = 120
+var pdfRenderScale = 1200
 
 // Non-hidden junk directories fd would otherwise happily index. Hidden dirs
 // never reach the list because the scan omits --hidden; these are the ones
 // users actually complain about.
 var builtinIgnoreNames = ["node_modules", "__pycache__"]
+
+// Every knob above can be overridden per-plugin from shell.json plugins[]
+// entries (snake_case keys); anything absent falls back to these static
+// defaults so the finder works with no configuration at all.
+function positiveInt(settings, name, fallback) {
+  var value = parseInt(setting(settings, name, fallback), 10)
+  return isFinite(value) && value > 0 ? value : fallback
+}
+
+function nonNegativeInt(settings, name, fallback) {
+  var value = parseInt(setting(settings, name, fallback), 10)
+  return isFinite(value) && value >= 0 ? value : fallback
+}
+
+function ignoredNames(settings) {
+  return asStringArray(setting(settings, "ignored_names", []))
+}
+
+function boolSetting(settings, name, fallback) {
+  var value = setting(settings, name, fallback)
+  if (value === true || value === "true") return true
+  if (value === false || value === "false") return false
+  return fallback
+}
+
+// Extra fd flags straight from shell.json ("fd_flags"), minus any type
+// selection: the builders pick --type per pass (files vs directories) and fd
+// unions repeated --type flags, so keeping user-supplied ones would make
+// both passes emit the same entries and corrupt the file/dir chunking.
+// Everything else (--ignore-vcs, --hidden, --follow, -E globs, …) passes
+// through verbatim. Paths/patterns stay builder-owned.
+function sanitizedFdFlags(flags) {
+  var out = []
+  var source = Array.isArray(flags) ? flags : []
+  for (var i = 0; i < source.length; i++) {
+    var flag = String(source[i] || "")
+    if (!flag) continue
+    if (flag === "--type" || flag === "-t") { i++; continue }
+    if (flag.indexOf("--type=") === 0 || flag.indexOf("-t=") === 0) continue
+    out.push(flag)
+  }
+  return out
+}
+
+// Quoted-for-shell flag segment with a trailing space, or "" when unset.
+function fdFlagSegment(flags) {
+  var clean = sanitizedFdFlags(flags)
+  var parts = []
+  for (var i = 0; i < clean.length; i++) parts.push(shellQuote(clean[i]))
+  return parts.length > 0 ? parts.join(" ") + " " : ""
+}
+
+function shellJoin(args) {
+  var parts = []
+  for (var i = 0; i < args.length; i++) parts.push(shellQuote(args[i]))
+  return parts
+}
+
+// Override-mode flags: verbatim, with --absolute-path appended when missing —
+// the index stores absolute paths, so relative output would be unusable.
+function fdOverrideArgs(flags) {
+  var args = Array.isArray(flags) ? flags.slice() : []
+  for (var i = 0; i < args.length; i++) {
+    if (args[i] === "--absolute-path") return args
+  }
+  args.push("--absolute-path")
+  return args
+}
+
+// Reads fd's path-per-line output on stdin and splits it into the framed
+// file/dir chunks markDirectories() expects, using only bash builtins so a
+// 100k-entry tree costs stat() calls rather than forks. Directories gain the
+// trailing "/" type marker here, in override mode where no dedicated
+// directory pass exists to do it. dirsFirst preserves browse ordering.
+function fdClassifySnippet(dirsFirst) {
+  var loop = 'while IFS= read -r p; do if [ -d "$p" ]; then __d+=("${p%/}/"); else __f+=("$p"); fi; done'
+  var files = 'printf \'%s\\n\' "${__f[@]}"'
+  var dirs = 'printf \'%s\\n\' "${__d[@]}"'
+  var marker = "printf '\\n" + scanSectionMarker + "\\n'"
+  var first = dirsFirst ? dirs : files
+  var second = dirsFirst ? files : dirs
+  return "{ " + loop + " ; " + first + " ; " + marker + " ; " + second + " ; }"
+}
+
+function resolveBrowseDir(settings, home) {
+  var expanded = expandPath(setting(settings, "browse_dir", ""), home)
+  return expanded || home + "/Downloads"
+}
+
+// Merges a shell.json plugins[] entry over the static defaults. The single
+// source of truth for every tunable the QML side and command builders need;
+// safe to call with {} or null.
+function resolveSettings(settings, home) {
+  var names = builtinIgnoreNames.concat(ignoredNames(settings))
+  var rawFd = asStringArray(setting(settings, "fd_flags", []))
+  return {
+    searchDirs: searchDirs(settings, home),
+    ignorePatterns: names.concat(expandPaths(asStringArray(setting(settings, "ignored_dirs", [])), home)),
+    maxScanResults: positiveInt(settings, "max_scan_results", maxScanResults),
+    maxDisplayRows: positiveInt(settings, "max_display_rows", maxDisplayRows),
+    maxBrowseRows: positiveInt(settings, "max_browse_rows", maxBrowseRows),
+    previewByteLimit: positiveInt(settings, "preview_byte_limit", previewByteLimit),
+    previewCacheLimit: positiveInt(settings, "preview_cache_limit", previewCacheLimit),
+    previewWorkers: positiveInt(settings, "preview_workers", previewWorkers),
+    debounceMs: nonNegativeInt(settings, "debounce_ms", debounceMs),
+    pdfRenderScale: positiveInt(settings, "pdf_render_scale", pdfRenderScale),
+    showHidden: boolSetting(settings, "show_hidden", false),
+    // Classic mode: user flags add to the builder-owned type selection.
+    fdFlags: sanitizedFdFlags(rawFd),
+    // Override mode: non-empty fd_flags replaces the whole flag set verbatim.
+    fdOverrideArgs: rawFd.length > 0 ? fdOverrideArgs(rawFd) : null,
+    browseDir: resolveBrowseDir(settings, home)
+  }
+}
+
+// Entry points used by QML: dispatch on whether fd_flags overrides.
+function scanCommand(cfg) {
+  if (cfg && cfg.fdOverrideArgs) {
+    var args = shellJoin(cfg.fdOverrideArgs)
+    var blocks = []
+    for (var i = 0; i < cfg.searchDirs.length; i++) {
+      var quotedDir = shellQuote(cfg.searchDirs[i])
+      var fdCmd = "fd " + args.join(" ") + " . " + quotedDir
+      blocks.push("( " + termRelay(fdCmd + " 2>/dev/null") + " | " + fdClassifySnippet(false)
+        + " ; printf '\\n" + scanBlockMarker + "\\n' ) 2>/dev/null")
+    }
+    var script = "( " + blocks.join(" ; ") + " ) 2>/dev/null"
+    var clean = []
+    for (var p = 0; p < cfg.ignorePatterns.length; p++) {
+      if (cfg.ignorePatterns[p]) clean.push(cfg.ignorePatterns[p])
+    }
+    if (clean.length > 0) {
+      var ig = []
+      for (var e = 0; e < clean.length; e++) ig.push("-e " + shellQuote(clean[e]))
+      script += " | grep -vF " + ig.join(" ")
+    }
+    script += " | head -n " + cfg.maxScanResults
+    return ["bash", "-c", script]
+  }
+  return buildScanCommand(cfg.searchDirs, cfg.ignorePatterns, cfg.maxScanResults, cfg.fdFlags, cfg.showHidden)
+}
+
+function browseCommand(cfg) {
+  if (cfg && cfg.fdOverrideArgs) {
+    var argStr = shellJoin(cfg.fdOverrideArgs).join(" ")
+    var quoted = shellQuote(cfg.browseDir)
+    var fdCmd = "fd " + argStr + " --min-depth 1 --max-depth 1 . " + quoted
+    var script = "{ [ -d " + quoted + " ] || exit 0 ; } ; "
+      + "( " + termRelay(fdCmd + " 2>/dev/null") + " | " + fdClassifySnippet(true) + " ) 2>/dev/null"
+      + " | head -n " + cfg.maxBrowseRows
+    return ["bash", "-c", script]
+  }
+  return buildBrowseCommand(cfg.browseDir, cfg.maxBrowseRows, cfg.fdFlags, cfg.showHidden)
+}
 
 function setting(settings, name, fallback) {
   var value = settings ? settings[name] : undefined
@@ -61,14 +219,36 @@ function shellQuote(value) {
   return "'" + String(value || "").replace(/'/g, "'\\''") + "'"
 }
 
+// Runs cmd as a direct child with SIGTERM relayed to it, so killing the bash
+// wrapper (stale-process teardown) also stops CPU/disk-heavy leaves like fd
+// and pdftoppm instead of orphaning them. Downstream pipeline members need no
+// relay: they exit on their own via EOF/EPIPE once the leaf dies.
+function termRelay(cmd) {
+  return "{ " + cmd + " & __p=$!; trap 'kill -TERM \"$__p\" 2>/dev/null' TERM INT; wait \"$__p\"; }"
+}
+
+// Marker lines framing scan output: "@@DIRS@@" separates a directory's file
+// chunk from its directory chunk, "@@END@@" closes each per-directory block.
+// Absolute paths can never start with "@", so both are unambiguous.
+var scanSectionMarker = "@@DIRS@@"
+var scanBlockMarker = "@@END@@"
+
 // One fd pass per search dir for files and another for directories so a
-// missing directory cannot sink the others; directories carry a trailing "/"
-// through the pipeline as their type marker.
-function buildScanCommand(dirs, patterns) {
+// missing directory cannot sink the others. Each pass is a relay-wrapped
+// leaf; the framed chunks are re-joined by markDirectories() per directory
+// with the trailing "/" type marker applied in JS, where it survives fzf
+// filtering like the old sed did.
+function buildScanCommand(dirs, patterns, scanLimit, fdFlags, showHidden) {
+  if (scanLimit === undefined) scanLimit = maxScanResults
+  var flags = fdFlagSegment(fdFlags)
+  if (showHidden) flags += "--hidden "
   var parts = []
   for (var i = 0; i < dirs.length; i++) {
-    parts.push("fd --type file --absolute-path . " + shellQuote(dirs[i]) + " 2>/dev/null"
-      + " ; fd --type directory --absolute-path . " + shellQuote(dirs[i]) + " 2>/dev/null | sed 's|[^/]$|&/|'")
+    parts.push("( "
+      + termRelay("fd " + flags + "--type file --absolute-path . " + shellQuote(dirs[i]))
+      + " ; printf '\\n" + scanSectionMarker + "\\n' ; "
+      + termRelay("fd " + flags + "--type directory --absolute-path . " + shellQuote(dirs[i]))
+      + " ; printf '\\n" + scanBlockMarker + "\\n' ) 2>/dev/null")
   }
   var script = "( " + parts.join(" ; ") + " ) 2>/dev/null"
   var clean = []
@@ -80,29 +260,61 @@ function buildScanCommand(dirs, patterns) {
     for (var e = 0; e < clean.length; e++) args.push("-e " + shellQuote(clean[e]))
     script += " | grep -vF " + args.join(" ")
   }
-  script += " | head -n " + maxScanResults
+  script += " | head -n " + scanLimit
   return ["bash", "-c", script]
+}
+
+// Re-joins framed scan blocks: each "files @@DIRS@@ dirs @@END@@" becomes
+// "files then dirs/" in original order, preserving the per-directory
+// grouping the old sed pipeline produced. Tolerates a severed tail (head -n
+// truncation) and empty chunks.
+function markDirectories(raw) {
+  var out = []
+  var blocks = String(raw || "").split(scanBlockMarker)
+  for (var b = 0; b < blocks.length; b++) {
+    var chunks = blocks[b].split(scanSectionMarker)
+    var files = chunks[0].split("\n")
+    var dirs = chunks.length > 1 ? chunks[1].split("\n") : []
+    for (var f = 0; f < files.length; f++) {
+      if (files[f].length > 4 && files[f].indexOf("/") === 0) out.push(files[f])
+    }
+    for (var d = 0; d < dirs.length; d++) {
+      var line = dirs[d]
+      if (line.length > 1 && line.indexOf("/") === 0) {
+        // fd emits directories with a trailing slash already; normalize any
+        // number of them to exactly one so display never sees "dir//".
+        line = line.replace(/\/+$/, "") + "/"
+        out.push(line)
+      }
+    }
+  }
+  return out
 }
 
 // Non-recursive snapshot of one directory, directories first. Shown when the
 // query is empty so the finder opens as a browser of ~/Downloads.
-function buildBrowseCommand(dir) {
+function buildBrowseCommand(dir, browseLimit, fdFlags, showHidden) {
+  if (browseLimit === undefined) browseLimit = maxBrowseRows
+  var flags = fdFlagSegment(fdFlags)
+  if (showHidden) flags += "--hidden "
   return ["bash", "-c",
     "{ [ -d " + shellQuote(dir) + " ] || exit 0 ; } ; "
-    + "( fd --type directory --absolute-path --min-depth 1 --max-depth 1 . " + shellQuote(dir) + " 2>/dev/null | sed 's|[^/]$|&/|'"
-    + " ; fd --type file --absolute-path --min-depth 1 --max-depth 1 . " + shellQuote(dir) + " 2>/dev/null )"
-    + " | head -n " + maxBrowseRows
+    + "( fd " + flags + "--type directory --absolute-path --min-depth 1 --max-depth 1 . " + shellQuote(dir) + " 2>/dev/null | sed 's|[^/]$|&/|'"
+    + " ; fd " + flags + "--type file --absolute-path --min-depth 1 --max-depth 1 . " + shellQuote(dir) + " 2>/dev/null )"
+    + " | head -n " + browseLimit
   ]
 }
 
-function buildSearchCommand(listPath, query) {
+function buildSearchCommand(listPath, query, displayLimit) {
+  if (displayLimit === undefined) displayLimit = maxDisplayRows
   return [
     "bash", "-c",
-    "fzf --filter " + shellQuote(query) + " --scheme=path 2>/dev/null < " + shellQuote(listPath) + " | head -n " + maxDisplayRows
+    "fzf --filter " + shellQuote(query) + " --scheme=path 2>/dev/null < " + shellQuote(listPath) + " | head -n " + displayLimit
   ]
 }
 
-function buildPreviewCommand(path) {
+function buildPreviewCommand(path, byteLimit) {
+  if (byteLimit === undefined) byteLimit = previewByteLimit
   var quoted = shellQuote(path)
   // First line is "\t<size>\t<mtime>"; the rest is file content. A size of -1
   // marks an unreadable or vanished file without a second round trip.
@@ -112,21 +324,25 @@ function buildPreviewCommand(path) {
     + " sz=$(stat -Lc %s -- " + quoted + " 2>/dev/null);"
     + " mt=$(stat -Lc %y -- " + quoted + " 2>/dev/null | cut -d. -f1);"
     + ' printf "\\t%s\\t%s\\n" "${sz:-?}" "$mt";'
-    + " head -c " + previewByteLimit + " -- " + quoted + " 2>/dev/null;"
+    + " head -c " + byteLimit + " -- " + quoted + " 2>/dev/null;"
     + " else printf '\\t-1\\t\\n'; fi"
   ]
 }
 
 // Directory preview: "\t-2\t<entry-count>" header, then a one-level listing
-// where nested directories keep their trailing slash.
-function buildDirPreviewCommand(path) {
+// where nested directories keep their trailing slash. Dot entries are
+// filtered out unless showHidden — matching the index's default policy.
+function buildDirPreviewCommand(path, byteLimit, showHidden) {
+  if (byteLimit === undefined) byteLimit = previewByteLimit
   var quoted = shellQuote(path)
+  var ls = "ls -1Ap --color=never -- " + quoted + " 2>/dev/null"
+  if (!showHidden) ls += " | grep -v '^\\.'"
   return [
     "bash", "-c",
     "{ [ -d " + quoted + " ] || exit 0 ; } ;"
-    + ' cnt=$(ls -1A -- ' + quoted + ' 2>/dev/null | wc -l);'
+    + ' cnt=$(ls -1A -- ' + quoted + ' 2>/dev/null' + (showHidden ? "" : " | grep -v '^\\.'") + ' | wc -l);'
     + ' printf "\\t-2\\t%s\\n" "$cnt";'
-    + " ls -1Ap --color=never -- " + quoted + " 2>/dev/null | head -c " + previewByteLimit
+    + " " + ls + " | head -c " + byteLimit
   ]
 }
 
@@ -190,16 +406,20 @@ function isVideoPath(path) {
 }
 
 // Renders page 1 of a PDF to <outBase>.png and reports "\t<size>\t<pages>"
-// so the caller can label the thumbnail without a second process.
-function buildPdfPreviewCommand(path, outBase) {
+// so the caller can label the thumbnail without a second process. pdftoppm
+// writes straight to a file rather than the pipe, so it is the one stage
+// that must be relay-wrapped to die on stale-process teardown.
+function buildPdfPreviewCommand(path, outBase, scale) {
+  if (scale === undefined) scale = pdfRenderScale
   var quoted = shellQuote(path)
+  var render = termRelay("pdftoppm -png -f 1 -singlefile -scale-to " + scale + " " + quoted + " " + shellQuote(outBase))
   return [
     "bash", "-c",
     "if [ -f " + quoted + " ] && [ -r " + quoted + " ]; then"
     + " sz=$(stat -Lc %s -- " + quoted + " 2>/dev/null);"
     + " pg=$(pdfinfo " + quoted + " 2>/dev/null | awk '/^Pages:/ {print $2}');"
     + ' printf "\\t%s\\t%s\\n" "${sz:-?}" "$pg";'
-    + " pdftoppm -png -f 1 -singlefile -scale-to 1200 " + quoted + " " + shellQuote(outBase) + " 2>/dev/null;"
+    + " " + render + ";"
     + " else printf '\\t-1\\t\\n'; fi"
   ]
 }
@@ -223,8 +443,28 @@ if (typeof module !== "undefined") {
     maxDisplayRows: maxDisplayRows,
     maxBrowseRows: maxBrowseRows,
     previewByteLimit: previewByteLimit,
+    previewCacheLimit: previewCacheLimit,
+    previewWorkers: previewWorkers,
+    debounceMs: debounceMs,
+    pdfRenderScale: pdfRenderScale,
     builtinIgnoreNames: builtinIgnoreNames,
+    termRelay: termRelay,
+    scanSectionMarker: scanSectionMarker,
+    scanBlockMarker: scanBlockMarker,
     setting: setting,
+    positiveInt: positiveInt,
+    nonNegativeInt: nonNegativeInt,
+    ignoredNames: ignoredNames,
+    boolSetting: boolSetting,
+    sanitizedFdFlags: sanitizedFdFlags,
+    fdFlagSegment: fdFlagSegment,
+    fdOverrideArgs: fdOverrideArgs,
+    fdClassifySnippet: fdClassifySnippet,
+    shellJoin: shellJoin,
+    resolveBrowseDir: resolveBrowseDir,
+    resolveSettings: resolveSettings,
+    scanCommand: scanCommand,
+    browseCommand: browseCommand,
     expandPath: expandPath,
     asStringArray: asStringArray,
     expandPaths: expandPaths,
@@ -232,6 +472,7 @@ if (typeof module !== "undefined") {
     ignorePatterns: ignorePatterns,
     shellQuote: shellQuote,
     buildScanCommand: buildScanCommand,
+    markDirectories: markDirectories,
     buildBrowseCommand: buildBrowseCommand,
     buildSearchCommand: buildSearchCommand,
     buildPreviewCommand: buildPreviewCommand,

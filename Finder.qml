@@ -22,7 +22,7 @@ Item {
   property int scanSerial: 0
   property int searchSerial: 0
   property int browseSerial: 0
-  property int previewSerial: 0
+  property bool scanQueued: false
   property bool previewIsImage: false
   property bool previewIsVideo: false
   property string previewSource: ""
@@ -31,7 +31,7 @@ Item {
 
   // path → { meta, content }, oldest-first key list for eviction. Read and
   // written imperatively only, so no binding ever depends on it.
-  readonly property int previewCacheLimit: 500
+  readonly property int previewCacheLimit: root.cfg.previewCacheLimit
   property var previewCache: ({})
   property var previewCacheKeys: []
   // Rendered first pages live at a fixed path; pdfCache remembers which
@@ -70,10 +70,12 @@ Item {
   readonly property string pluginId: manifest && manifest.id ? String(manifest.id) : "shafayet.finder"
   readonly property string listPath: home + "/.local/state/omarchy/file-finder-list.txt"
   // Shown instead of nothing while the query is empty, so opening the finder
-  // doubles as a browser of recent downloads.
-  readonly property string browseDir: home + "/Downloads"
+  // doubles as a browser of a configurable directory (~/Downloads default).
+  readonly property string browseDir: root.cfg.browseDir
 
-  // Settings come from this plugin's entry in shell.json plugins[], e.g.
+  // Settings come from this plugin's entry in shell.json plugins[]. Every
+  // tunable is merged over static defaults by resolveSettings, so the finder
+  // works untouched and each value stays individually overridable, e.g.
   // { "id": "shafayet.finder", "search_dirs": ["$HOME"], "ignored_dirs": ["$HOME/.cache"] }
   readonly property var pluginSettings: {
     var config = shell && shell.shellConfig ? shell.shellConfig : null
@@ -84,8 +86,10 @@ Item {
     }
     return {}
   }
-  readonly property var searchDirs: FinderModel.searchDirs(pluginSettings, home)
-  readonly property var ignorePatterns: FinderModel.ignorePatterns(pluginSettings, home)
+
+  // Single source for every knob: search dirs, ignores, limits, pool size,
+  // debounce, PDF scale. See FinderModel.resolveSettings for the defaults.
+  readonly property var cfg: FinderModel.resolveSettings(pluginSettings, home)
 
   function open(payloadJson) {
     root.opened = true
@@ -94,10 +98,8 @@ Item {
     root.cursorActive = true
     root.disarmPointer()
     root.clearPreview()
-    // Fresh previews each session so long-lived entries never go stale.
-    root.previewCache = ({})
-    root.previewCacheKeys = []
-    root.pdfCache = ({})
+    // Preview and PDF caches persist across toggles for the whole shell
+    // session, so revisiting a file re-shows its preview instantly.
     root.rebuildDisplay()
     root.refreshScan()
     searchDebounce.restart()
@@ -105,17 +107,16 @@ Item {
   }
 
   function close() {
-    // Blank immediately and cancel anything queued: a pending debounce must
-    // not repaint the pane after the overlay is gone, and reopening must
-    // never inherit the previous session's preview.
+    // Blank immediately, cancel anything queued, and stop every process this
+    // session made stale: a pending debounce must not repaint the pane after
+    // the overlay is gone. The scan is left running on purpose — its result
+    // feeds the persistent list cache that makes the next open instant.
     root.opened = false
     searchDebounce.stop()
     browseDebounce.stop()
     previewDebounce.stop()
+    root.cancelPendingWork()
     root.clearPreview()
-    root.previewCache = ({})
-    root.previewCacheKeys = []
-    root.pdfCache = ({})
     Util.execDetached("rm -f " + Util.shellQuote(root.pdfPngPath))
   }
 
@@ -124,25 +125,39 @@ Item {
     else root.open("{}")
   }
 
+  // Termination is asynchronous: a Process ignores `running = true` until it
+  // fully exits, so a fresh run requested mid-teardown queues itself and
+  // starts from onExited instead of being silently dropped.
   function refreshScan() {
     root.scanSerial++
     scanProc.revision = root.scanSerial
-    scanProc.command = FinderModel.buildScanCommand(root.searchDirs, root.ignorePatterns)
-    scanProc.running = true
     root.scanning = true
+    root.scanQueued = true
+    if (!scanProc.running) startScan()
+    else scanProc.running = false
+  }
+
+  function startScan() {
+    if (!root.scanQueued) return
+    root.scanQueued = false
+    scanProc.command = FinderModel.scanCommand(root.cfg)
+    scanProc.running = true
   }
 
   function applyScan(raw) {
-    var count = 0
-    var lines = String(raw || "").split("\n")
-    for (var i = 0; i < lines.length; i++) {
-      if (lines[i].trim()) count++
-    }
-
-    root.fileListCount = count
+    var text = String(raw || "")
+    root.fileListCount = FinderModel.markDirectories(text).length
     root.scanning = false
-    listFile.setText(String(raw || ""))
+    listFile.setText(text)
     if (root.opened && root.filterText.trim()) searchDebounce.restart()
+  }
+
+  // Called at shell start when the persisted list loads: the cached index is
+  // counted into memory immediately so the finder opens searchable without
+  // waiting for the first rescan. A refresh landing later simply overwrites
+  // this via applyScan.
+  function loadCachedList(raw) {
+    root.fileListCount = FinderModel.markDirectories(String(raw || "")).length
   }
 
   function startBrowse() {
@@ -152,7 +167,7 @@ Item {
     }
     root.browseSerial++
     browseProc.revision = root.browseSerial
-    browseProc.command = FinderModel.buildBrowseCommand(root.browseDir)
+    browseProc.command = FinderModel.browseCommand(root.cfg)
     browseProc.running = true
   }
 
@@ -165,14 +180,28 @@ Item {
       root.startBrowse()
       return
     }
-    if (root.fileListCount === 0 || scanProc.running) {
+    // Searching is allowed even while a rescan is in flight: the persisted
+    // list from the previous scan stays valid until the new one lands.
+    if (root.fileListCount === 0) {
       root.searchResults = []
       root.rebuildDisplay()
       return
     }
 
+    searchProc.queuedStart = true
+    if (!searchProc.running) startSearch()
+    else searchProc.running = false
+  }
+
+  // Revalidates at actual start time: whatever the filter is THEN is what
+  // runs, so a query superseded during teardown never launches stale.
+  function startSearch() {
+    if (!searchProc.queuedStart) return
+    searchProc.queuedStart = false
+    var query = root.filterText.trim()
+    if (!query || !root.opened || root.fileListCount === 0) return
     searchProc.revision = root.searchSerial
-    searchProc.command = FinderModel.buildSearchCommand(root.listPath, query)
+    searchProc.command = FinderModel.buildSearchCommand(root.listPath, query, root.cfg.maxDisplayRows)
     searchProc.running = true
   }
 
@@ -229,7 +258,31 @@ Item {
     root.selectedIndex = 0
     root.cursorActive = true
     root.disarmPointer()
+    // Every keystroke makes every in-flight search/browse/preview stale:
+    // stop them now instead of letting them run to an invisible finish.
+    root.cancelPendingWork()
     searchDebounce.restart()
+  }
+
+  // Orphans the serials of anything in flight so late output can never land,
+  // then SIGTERMs the processes themselves to free CPU and disk at once.
+  function cancelPendingWork() {
+    root.searchSerial++
+    searchProc.revision = root.searchSerial
+    if (searchProc.running) searchProc.running = false
+    root.browseSerial++
+    browseProc.revision = root.browseSerial
+    if (browseProc.running) browseProc.running = false
+    root.killPreviewWorkers()
+  }
+
+  function killPreviewWorkers() {
+    for (var i = 0; i < previewPool.length; i++) {
+      if (previewPool[i].running) {
+        previewPool[i].cancelled = true
+        previewPool[i].running = false
+      }
+    }
   }
 
   function disarmPointer() {
@@ -300,30 +353,38 @@ Item {
     }
 
     var marked = row.path
+
+    if (FinderModel.isVideoPath(marked)) {
+      root.previewIsImage = false
+      root.previewIsVideo = true
+      root.previewSource = ""
+      root.previewMeta = ""
+      root.previewContent = ""
+      return
+    }
     root.previewIsVideo = false
 
+    if (FinderModel.isImagePath(marked)) {
+      root.previewIsImage = true
+      root.previewSource = Util.fileUrl(marked)
+      root.previewMeta = ""
+      root.previewContent = ""
+      root.prefetchNeighbors()
+      return
+    }
+    root.previewIsImage = false
+
     if (FinderModel.isDirPath(marked)) {
-      root.previewIsImage = false
       var cleanDir = FinderModel.cleanPath(marked)
       var dirHit = root.cachedPreview(cleanDir)
       if (dirHit) {
         root.previewMeta = dirHit.meta
         root.previewContent = dirHit.content
+        root.prefetchNeighbors()
         return
       }
-      if (previewProc.running) {
-        // Invalidate the in-flight run so it can never land for this
-        // selection, then retry once it exits.
-        root.previewSerial++
-        previewDebounce.restart()
-        return
-      }
-      root.previewSerial++
-      previewProc.revision = root.previewSerial
-      previewProc.kind = "dir"
-      previewProc.currentPath = cleanDir
-      previewProc.command = FinderModel.buildDirPreviewCommand(cleanDir)
-      previewProc.running = true
+      root.dispatchPreview("dir", cleanDir, marked, FinderModel.buildDirPreviewCommand(cleanDir, root.cfg.previewByteLimit, root.cfg.showHidden))
+      root.prefetchNeighbors()
       return
     }
 
@@ -337,63 +398,26 @@ Item {
         root.previewContent = ""
         return
       }
-      if (previewProc.running) {
-        // Invalidate the in-flight render so its result can never land for
-        // this (different) selection, then retry once it exits.
-        root.previewSerial++
-        previewDebounce.restart()
-        return
-      }
-      root.previewSerial++
-      previewProc.kind = "pdf"
-      previewProc.revision = root.previewSerial
-      previewProc.currentPath = cleanPdf
-      previewProc.command = FinderModel.buildPdfPreviewCommand(cleanPdf, root.pdfPngBase)
-      previewProc.running = true
+      // PDF renders are heavy; not prefetched, so no neighbor pass here.
+      root.dispatchPreview("pdf", cleanPdf, marked, FinderModel.buildPdfPreviewCommand(cleanPdf, root.pdfPngBase, root.cfg.pdfRenderScale))
       return
     }
 
-    if (FinderModel.isVideoPath(marked)) {
-      root.previewIsImage = false
-      root.previewIsVideo = true
-      root.previewSource = ""
-      root.previewMeta = ""
-      root.previewContent = ""
-      return
-    }
-
-    if (FinderModel.isImagePath(marked)) {
-      root.previewSerial++
-      root.previewIsImage = true
-      root.previewSource = Util.fileUrl(marked)
-      root.previewMeta = ""
-      root.previewContent = ""
-      return
-    }
-
-    root.previewIsImage = false
     var fileHit = root.cachedPreview(marked)
     if (fileHit) {
       root.previewMeta = fileHit.meta
       root.previewContent = fileHit.content
+      root.prefetchNeighbors()
       return
     }
-    if (previewProc.running) {
-      // A Process ignores a command change while running: invalidate whatever
-      // is in flight so its result cannot land for this selection, then retry.
-      root.previewSerial++
-      previewDebounce.restart()
-      return
-    }
-    root.previewSerial++
-    previewProc.revision = root.previewSerial
-    previewProc.kind = "file"
-    previewProc.currentPath = marked
-    previewProc.command = FinderModel.buildPreviewCommand(marked)
-    previewProc.running = true
+    root.dispatchPreview("file", marked, marked, FinderModel.buildPreviewCommand(marked, root.cfg.previewByteLimit))
+    root.prefetchNeighbors()
   }
 
-  Component.onCompleted: mkdirProc.running = true
+  Component.onCompleted: {
+    ensurePool()
+    mkdirProc.running = true
+  }
 
   ListModel { id: displayModel }
 
@@ -409,6 +433,8 @@ Item {
     path: root.listPath
     atomicWrites: true
     printErrors: false
+    onLoaded: root.loadCachedList(text())
+    onLoadFailed: root.loadCachedList("")
   }
 
   Process {
@@ -420,6 +446,7 @@ Item {
   Process {
     id: scanProc
     property int revision: 0
+    onExited: root.startScan()
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -430,13 +457,13 @@ Item {
 
   Timer {
     id: searchDebounce
-    interval: 120
+    interval: root.cfg.debounceMs
     onTriggered: root.requestSearch()
   }
 
   Timer {
     id: browseDebounce
-    interval: 120
+    interval: root.cfg.debounceMs
     onTriggered: root.startBrowse()
   }
 
@@ -462,13 +489,15 @@ Item {
   Process {
     id: searchProc
     property int revision: -1
+    property bool queuedStart: false
+    onExited: root.startSearch()
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         if (searchProc.revision !== root.searchSerial) return
         var rows = []
         var lines = String(text || "").split("\n")
-        for (var i = 0; i < lines.length && rows.length < FinderModel.maxDisplayRows; i++) {
+        for (var i = 0; i < lines.length && rows.length < root.cfg.maxDisplayRows; i++) {
           var line = lines[i]
           if (line.length > 4 && line.indexOf("/") === 0) rows.push(line)
         }
@@ -480,66 +509,156 @@ Item {
 
   Timer {
     id: previewDebounce
-    interval: 120
+    interval: root.cfg.debounceMs
     onTriggered: root.requestPreview()
   }
 
-  Process {
-    id: previewProc
-    property int revision: 0
-    property string currentPath: ""
-    property string kind: "file"
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        if (previewProc.revision !== root.previewSerial) return
-        if (!root.opened) return
-        var parsed = FinderModel.parsePreviewOutput(text)
-        if (previewProc.kind === "pdf") {
-          if (parsed.size === -1) {
-            root.previewIsImage = false
-            root.previewMeta = "Unreadable file"
-            root.previewContent = ""
-            return
-          }
-          root.pdfRenderVersion++
-          // No meta line for PDFs: the page thumbnail owns the whole pane.
-          root.previewIsImage = true
-          root.previewSource = root.pdfSourceUrl(root.pdfRenderVersion)
-          root.previewMeta = ""
-          root.previewContent = ""
-          root.pdfCache[previewProc.currentPath] = { ver: root.pdfRenderVersion }
-          return
-        }
-        if (parsed.size === -2) {
-          var items = parseInt(parsed.mtime, 10)
-          root.previewMeta = "Directory — " + (isNaN(items) ? "?" : items) + " items"
-          root.previewContent = parsed.content
-          root.storePreviewInCache(previewProc.currentPath, root.previewMeta, root.previewContent)
-          return
-        }
-        if (parsed.size === -1) {
-          // Uncached so a file that reappears gets a fresh attempt.
-          root.previewMeta = "Unreadable file"
-          root.previewContent = ""
-          return
-        }
-        if (parsed.content.indexOf("\u0000") >= 0) {
-          root.previewMeta = FinderModel.formatBytes(parsed.size) + " — binary file"
-          root.previewContent = ""
-          root.storePreviewInCache(previewProc.currentPath, root.previewMeta, root.previewContent)
-          return
-        }
-        var meta = FinderModel.formatBytes(parsed.size)
-        if (parsed.mtime) meta += "  ·  " + parsed.mtime
-        root.previewMeta = meta
-        root.previewContent = parsed.content
-        root.storePreviewInCache(previewProc.currentPath, root.previewMeta, root.previewContent)
+  // Preview workers run concurrently so a slow PDF render never serializes
+  // behind directory listings or text heads, and prefetched neighbors land
+  // while the selected row is still being read. Results are keyed by path,
+  // so a killed stale worker's partial output can only ever populate the
+  // cache for its own file — display updates additionally require the
+  // worker's row to still be selected.
+  Component {
+    id: previewWorkerComp
+
+    Process {
+      id: worker
+      property string kind: "file"
+      property string currentPath: ""
+      property string displayKey: ""
+      // Set when the worker is killed mid-run so its truncated output can
+      // never populate the cache.
+      property bool cancelled: false
+      stdout: StdioCollector {
+        waitForEnd: true
+        onStreamFinished: root.finishPreview(worker, text)
       }
     }
   }
 
-  onSelectedIndexChanged: previewDebounce.restart()
+  property var previewPool: []
+
+  function ensurePool() {
+    if (previewPool.length > 0) return
+    var size = Math.max(1, root.cfg.previewWorkers)
+    for (var i = 0; i < size; i++) {
+      previewPool.push(previewWorkerComp.createObject(root))
+    }
+  }
+
+  function idlePreviewWorker() {
+    for (var i = 0; i < previewPool.length; i++) {
+      if (!previewPool[i].running) return previewPool[i]
+    }
+    return null
+  }
+
+  function dispatchPreview(kind, cachePath, forKey, command) {
+    var worker = root.idlePreviewWorker()
+    if (!worker) {
+      // All slots busy: retry shortly rather than queueing work that may be
+      // stale by the time a slot frees up.
+      previewDebounce.restart()
+      return
+    }
+    worker.kind = kind
+    worker.currentPath = cachePath
+    worker.displayKey = forKey
+    worker.cancelled = false
+    worker.command = command
+    worker.running = true
+  }
+
+  // Renders adjacent rows' previews into the cache ahead of time using spare
+  // workers, so arrowing through results feels instantaneous. Videos, images
+  // and PDFs are excluded — they need no process, decode off-thread already,
+  // or cost more than background churn is worth.
+  function prefetchNeighbors() {
+    for (var d = -1; d <= 1; d += 2) {
+      var idx = root.selectedIndex + d
+      if (idx < 0 || idx >= displayModel.count) continue
+      var row = activeRow(idx)
+      if (!row) continue
+      var marked = row.path
+      if (FinderModel.isVideoPath(marked) || FinderModel.isImagePath(marked) || FinderModel.isPdfPath(marked)) continue
+      var isDir = FinderModel.isDirPath(marked)
+      var cachePath = isDir ? FinderModel.cleanPath(marked) : marked
+      if (root.cachedPreview(cachePath)) continue
+      var command = isDir
+        ? FinderModel.buildDirPreviewCommand(cachePath, root.cfg.previewByteLimit, root.cfg.showHidden)
+        : FinderModel.buildPreviewCommand(marked, root.cfg.previewByteLimit)
+      dispatchPreview("file", cachePath, "", command)
+      if (!root.idlePreviewWorker()) return
+    }
+  }
+
+  function finishPreview(worker, rawOutput) {
+    if (!root.opened || worker.cancelled) return
+    var parsed = FinderModel.parsePreviewOutput(rawOutput)
+    var selectedRow = activeRow(root.selectedIndex)
+    var isSelected = selectedRow !== null && worker.displayKey !== "" && worker.displayKey === selectedRow.path
+
+    if (worker.kind === "pdf") {
+      if (parsed.size === -1) {
+        if (isSelected) {
+          root.previewIsImage = false
+          root.previewMeta = "Unreadable file"
+          root.previewContent = ""
+        }
+        return
+      }
+      root.pdfRenderVersion++
+      root.pdfCache[worker.currentPath] = { ver: root.pdfRenderVersion }
+      if (isSelected) {
+        // No meta line for PDFs: the page thumbnail owns the whole pane.
+        root.previewIsImage = true
+        root.previewSource = root.pdfSourceUrl(root.pdfRenderVersion)
+        root.previewMeta = ""
+        root.previewContent = ""
+      }
+      return
+    }
+
+    if (parsed.size === -2) {
+      var items = parseInt(parsed.mtime, 10)
+      var dirMeta = "Directory — " + (isNaN(items) ? "?" : items) + " items"
+      root.storePreviewInCache(worker.currentPath, dirMeta, parsed.content)
+      if (isSelected) {
+        root.previewMeta = dirMeta
+        root.previewContent = parsed.content
+      }
+      return
+    }
+    if (parsed.size === -1) {
+      // Uncached so a file that reappears gets a fresh attempt.
+      if (isSelected) {
+        root.previewMeta = "Unreadable file"
+        root.previewContent = ""
+      }
+      return
+    }
+    var meta
+    var content
+    if (parsed.content.indexOf("\u0000") >= 0) {
+      meta = FinderModel.formatBytes(parsed.size) + " — binary file"
+      content = ""
+    } else {
+      meta = FinderModel.formatBytes(parsed.size)
+      if (parsed.mtime) meta += "  ·  " + parsed.mtime
+      content = parsed.content
+    }
+    root.storePreviewInCache(worker.currentPath, meta, content)
+    if (isSelected) {
+      root.previewMeta = meta
+      root.previewContent = content
+    }
+  }
+
+  onSelectedIndexChanged: {
+    root.killPreviewWorkers()
+    previewDebounce.restart()
+  }
 
   PanelWindow {
     id: panel
