@@ -3,6 +3,13 @@
 Fuzzy file finder overlay for the Omarchy shell with live previews: text
 heads, directory listings, images, PDF first-page renders, and video frame grabs.
 
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/8c5db8a4-c0ad-4921-a1db-7de8608835be" />
+
+
+https://github.com/user-attachments/assets/c07ae865-26f7-41d2-b890-42eb8456685f
+
+
+
 ## Usage
 
 Open the finder from your configured launcher binding. Keys:
