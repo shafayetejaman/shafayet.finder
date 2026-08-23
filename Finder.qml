@@ -36,20 +36,17 @@ Item {
   readonly property int previewCacheLimit: root.cfg.previewCacheLimit
   property var previewCache: ({})
   property var previewCacheKeys: []
-  // Rendered first pages live at a fixed path; pdfCache remembers which
-  // document each render belongs to so revisits skip pdftoppm entirely.
-  // Cleared whenever the overlay closes — close() removes the render file,
-  // so stale entries would otherwise point at a missing image forever.
+  // Scratch base for pdftoppm runs: each job appends its own "-<pid>.png"
+  // suffix and removes the file afterwards, so concurrent or killed renders
+  // can never overwrite each other and nothing persists on disk.
   readonly property string pdfPngBase: home + "/.local/state/omarchy/file-finder-pdf"
-  readonly property string pdfPngPath: pdfPngBase + ".png"
+  // path → { url }, url being a self-contained data:image/png;base64 payload
+  // held in memory. Storing bytes instead of pointing at a shared render file
+  // means an entry can never go stale under us — switching PDFs overwrites
+  // nothing, so arrowing between documents always shows each one's own page.
+  readonly property int pdfCacheLimit: root.cfg.pdfCacheLimit
   property var pdfCache: ({})
-  // Qt's image cache keys on the URL, and every render lands on the same
-  // file — without a version bump a second PDF would keep showing the first.
-  property int pdfRenderVersion: 0
-
-  function pdfSourceUrl(version) {
-    return Util.fileUrl(root.pdfPngPath) + "?v=" + version
-  }
+  property var pdfCacheKeys: []
 
   // Shares the [menu] surface tokens — themes that style the menu also
   // style the finder, matching the clipboard overlay's approach.
@@ -102,9 +99,9 @@ Item {
     root.cursorActive = true
     root.disarmPointer()
     root.clearPreview()
-    // The preview cache persists across toggles for the whole shell
-    // session, so revisiting a file re-shows its preview instantly. (The
-    // PDF render cache resets on close; see close().)
+    // The preview caches persist across toggles for the whole shell session,
+    // so revisiting a file re-shows its preview instantly — PDF thumbnails
+    // included, since their entries are self-contained data URLs.
     root.rebuildDisplay()
     root.refreshScan()
     searchDebounce.restart()
@@ -123,11 +120,10 @@ Item {
     previewDebounce.stop()
     root.cancelPendingWork()
     root.clearPreview()
-    // Last session's rows must not flash under the empty filter on reopen,
-    // and pdfCache entries would point at the render file removed below.
+    // Last session's rows must not flash under the empty filter on reopen.
+    // The PDF cache stays too: its entries are self-contained data URLs that
+    // reference no disk state, so they cannot go stale across sessions.
     root.searchResults = []
-    root.pdfCache = {}
-    Util.execDetached("rm -f " + Util.shellQuote(root.pdfPngPath))
   }
 
   function toggle() {
@@ -447,6 +443,33 @@ Item {
     cache[path] = { meta: meta, content: content }
   }
 
+  function cachedPdf(path) {
+    var hit = root.pdfCache[path] || null
+    if (hit) root.touchPdfCache(path)
+    return hit
+  }
+
+  // Moves a key to the tail on hit so eviction follows real recency (LRU).
+  function touchPdfCache(path) {
+    var keys = root.pdfCacheKeys
+    var idx = keys.indexOf(path)
+    if (idx < 0 || idx === keys.length - 1) return
+    keys.splice(idx, 1)
+    keys.push(path)
+  }
+
+  function storePdfInCache(path, url) {
+    if (!path || !url) return
+    var cache = root.pdfCache
+    if (!cache[path]) {
+      var keys = root.pdfCacheKeys.slice()
+      keys.push(path)
+      while (keys.length > root.pdfCacheLimit) delete cache[keys.shift()]
+      root.pdfCacheKeys = keys
+    }
+    cache[path] = { url: url }
+  }
+
   function clearPreview() {
     root.previewIsImage = false
     root.previewIsVideo = false
@@ -500,10 +523,10 @@ Item {
 
     if (FinderModel.isPdfPath(marked)) {
       var cleanPdf = FinderModel.cleanPath(marked)
-      var pdfHit = root.pdfCache[cleanPdf]
+      var pdfHit = root.cachedPdf(cleanPdf)
       if (pdfHit) {
         root.previewIsImage = true
-        root.previewSource = root.pdfSourceUrl(pdfHit.ver)
+        root.previewSource = pdfHit.url
         root.previewMeta = ""
         root.previewContent = ""
         return
@@ -757,12 +780,12 @@ Item {
         }
         return
       }
-      root.pdfRenderVersion++
-      root.pdfCache[worker.currentPath] = { ver: root.pdfRenderVersion }
+      var url = FinderModel.pdfDataUrl(parsed.content)
+      root.storePdfInCache(worker.currentPath, url)
       if (isSelected) {
         // No meta line for PDFs: the page thumbnail owns the whole pane.
         root.previewIsImage = true
-        root.previewSource = root.pdfSourceUrl(root.pdfRenderVersion)
+        root.previewSource = url
         root.previewMeta = ""
         root.previewContent = ""
       }
@@ -844,10 +867,10 @@ Item {
     if (isDir) {
       hit = root.cachedPreview(FinderModel.cleanPath(marked))
     } else if (FinderModel.isPdfPath(marked)) {
-      var pdfHit = root.pdfCache[FinderModel.cleanPath(marked)]
+      var pdfHit = root.cachedPdf(FinderModel.cleanPath(marked))
       if (pdfHit) {
         root.previewIsImage = true
-        root.previewSource = root.pdfSourceUrl(pdfHit.ver)
+        root.previewSource = pdfHit.url
         root.previewMeta = ""
         root.previewContent = ""
         return true

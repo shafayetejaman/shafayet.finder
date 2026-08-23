@@ -7,6 +7,7 @@ var maxDisplayRows = 50
 var maxBrowseRows = 200
 var previewByteLimit = 65536
 var previewCacheLimit = 500
+var pdfCacheLimit = 12
 var previewWorkers = 3
 var debounceMs = 40
 var fdDebounceMs = 1000
@@ -134,6 +135,7 @@ function resolveSettings(settings, home) {
     maxBrowseRows: positiveInt(settings, "max_browse_rows", maxBrowseRows),
     previewByteLimit: positiveInt(settings, "preview_byte_limit", previewByteLimit),
     previewCacheLimit: positiveInt(settings, "preview_cache_limit", previewCacheLimit),
+    pdfCacheLimit: positiveInt(settings, "pdf_cache_limit", pdfCacheLimit),
     previewWorkers: positiveInt(settings, "preview_workers", previewWorkers),
     debounceMs: nonNegativeInt(settings, "debounce_ms", debounceMs),
     fdDebounceMs: nonNegativeInt(settings, "fd_debounce_ms", fdDebounceMs),
@@ -594,27 +596,38 @@ function isVideoPath(path) {
   return /\.(mp4|mkv|webm|mov|avi|m4v|mpg|mpeg|wmv|flv|m2ts|ts|3gp|ogv)$/i.test(String(path || ""))
 }
 
-// Renders page 1 of a PDF to <outBase>.png and reports "\t<size>\t" so the
-// caller can label the thumbnail. pdftoppm writes straight to a file rather
-// than the pipe, so it is relay-wrapped to die on stale-process teardown,
-// and the header is only printed after checking that a non-empty PNG
-// actually landed: a corrupt or unreadable document reports size -1 instead
-// of being cached as successfully rendered.
+// Renders page 1 of a PDF into a per-job scratch PNG ("base-job-<pid>.png",
+// so overlapping or killed renders can never read each other's pixels) and
+// reports "\t<size>\t" followed by the image as base64 text, so the whole
+// payload survives the stdout text collector and can live in an in-memory
+// cache instead of aliasing a shared file that the next render overwrites.
+// pdftoppm is relay-wrapped to die on stale-process teardown, and the header
+// is only printed after checking that a non-empty PNG actually landed: a
+// corrupt or unreadable document reports size -1 instead of being cached as
+// successfully rendered. The scratch file is removed even after failed
+// renders; only a SIGKILLed mid-render job could leak one.
 function buildPdfPreviewCommand(path, outBase, scale) {
   if (scale === undefined) scale = pdfRenderScale
   var quoted = shellQuote(path)
-  var pngQuoted = shellQuote(outBase + ".png")
-  var render = termRelay("pdftoppm -png -f 1 -singlefile -scale-to " + scale + " " + quoted + " " + shellQuote(outBase))
   return [
     "bash", "-c",
     "if [ -f " + quoted + " ] && [ -r " + quoted + " ]; then"
     + " sz=$(stat -Lc %s -- " + quoted + " 2>/dev/null);"
-    + " " + render + ";"
-    + " if [ -s " + pngQuoted + " ]; then"
+    + " tmp=" + shellQuote(outBase) + '-job-"$$".png;'
+    + " " + termRelay("pdftoppm -png -f 1 -singlefile -scale-to " + scale + " " + quoted + " \"${tmp%.png}\"") + ";"
+    + " if [ -s \"$tmp\" ]; then"
     + ' printf "\\t%s\\t\\n" "${sz:-?}";'
-    + " else printf '\\t-1\\t\\n'; fi"
+    + " base64 -w0 \"$tmp\";"
+    + " else printf '\\t-1\\t\\n'; fi;"
+    + " rm -f -- \"$tmp\";"
     + " else printf '\\t-1\\t\\n'; fi"
   ]
+}
+
+// Wraps base64 PNG bytes into a self-contained <img> source. Whitespace must
+// go: base64's trailing newline would corrupt the data URI.
+function pdfDataUrl(b64) {
+  return "data:image/png;base64," + String(b64 || "").replace(/\s+/g, "")
 }
 
 function formatBytes(bytes) {
@@ -637,6 +650,7 @@ if (typeof module !== "undefined") {
     maxBrowseRows: maxBrowseRows,
     previewByteLimit: previewByteLimit,
     previewCacheLimit: previewCacheLimit,
+    pdfCacheLimit: pdfCacheLimit,
     previewWorkers: previewWorkers,
     debounceMs: debounceMs,
     rescanIntervalMs: rescanIntervalMs,
@@ -690,6 +704,7 @@ if (typeof module !== "undefined") {
     isPdfPath: isPdfPath,
     isVideoPath: isVideoPath,
     buildPdfPreviewCommand: buildPdfPreviewCommand,
+    pdfDataUrl: pdfDataUrl,
     formatBytes: formatBytes
   }
 }

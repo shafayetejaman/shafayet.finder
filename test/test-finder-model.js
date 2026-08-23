@@ -158,6 +158,20 @@ var dp = M.buildDirPreviewCommand("/dir", 4096, false)
 ok(dp[2].indexOf("-2") !== -1, "dir preview header marker")
 ok(dp[2].indexOf("grep -v '^\\.'") !== -1, "dot entries filtered when hidden")
 
+// ================= pdf preview =================
+
+eq(M.pdfDataUrl("iVBOR\n"), "data:image/png;base64,iVBOR", "pdf data url strips whitespace")
+eq(M.pdfDataUrl(""), "data:image/png;base64,", "pdf data url tolerates empty payload")
+
+var pc = M.buildPdfPreviewCommand("/my pdf.pdf", "/tmp/base", 800)
+ok(pc[2].indexOf("pdftoppm -png -f 1 -singlefile -scale-to 800 '/my pdf.pdf' \"${tmp%.png}\"") !== -1,
+  "pdf render targets per-job scratch outbase")
+ok(pc[2].indexOf("-job-\"$$\".png;") !== -1, "scratch name unique per job")
+ok(pc[2].indexOf("base64 -w0 \"$tmp\"") !== -1, "payload emitted as base64 text")
+ok(pc[2].indexOf("rm -f -- \"$tmp\";") !== -1, "scratch cleaned up")
+ok(pc[2].indexOf("printf '\\t-1\\t\\n'") !== -1, "unreadable marker present")
+ok(pc[2].indexOf("head -c") === -1, "pdf payload not byte-capped")
+
 // ================= misc regressions =================
 
 eq(M.shellQuote("it's"), "'it'\\''s'", "shellQuote escapes singles")
@@ -295,6 +309,41 @@ ok(M.liveFdCommand(liveCfg, parse("--size +5mb"), 50)[2].indexOf("'.' \"${__p[@]
   eq(runLive("--type f . big"), [path.join(root, "big.txt")], "live: fzf stage filters fd output")
   // unknown/broken flag -> silent empty result
   eq(runLive("--frobnicate x"), [], "live: broken flag yields silence")
+
+  fs.rmSync(tmp, { recursive: true, force: true })
+})()
+
+// PDF preview integration: renders a hand-written minimal PDF through the
+// real pdftoppm pipeline and proves the payload arrives as a decodable PNG
+// data url with no scratch file left behind. Skips silently when poppler is
+// not installed.
+;(function integrationPdf() {
+  var probe = cp.spawnSync("pdftoppm", ["-v"], { encoding: "utf8" })
+  if (probe.error || probe.status !== 0) return
+
+  var tmp = fs.mkdtempSync(path.join(os.tmpdir(), "finder-pdf-"))
+  var pdf = path.join(tmp, "doc.pdf")
+  fs.writeFileSync(pdf,
+    "%PDF-1.4\n"
+    + "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+    + "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+    + "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]>>endobj\n"
+    + "trailer<</Root 1 0 R/Size 4>>\n%%EOF\n")
+
+  var cmd = M.buildPdfPreviewCommand(pdf, path.join(tmp, "render"), 200)
+  var out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+  var parsed = M.parsePreviewOutput(out)
+
+  ok(parsed.size > 0, "integration: pdf header reports a size")
+  ok(M.pdfDataUrl(parsed.content).indexOf("data:image/png;base64,iVBOR") === 0,
+    "integration: payload is a PNG data url")
+  ok(fs.readdirSync(tmp).filter(function (f) { return f.slice(-4) === ".png" }).length === 0,
+    "integration: scratch png removed")
+
+  // Unreadable path reports the -1 marker instead of a payload.
+  cmd = M.buildPdfPreviewCommand(path.join(tmp, "missing.pdf"), path.join(tmp, "render"), 200)
+  out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+  eq(M.parsePreviewOutput(out).size, -1, "integration: missing pdf reports unreadable")
 
   fs.rmSync(tmp, { recursive: true, force: true })
 })()
