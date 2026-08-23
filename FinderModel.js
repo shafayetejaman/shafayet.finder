@@ -4,6 +4,7 @@
 
 var maxScanResults = 100000
 var maxDisplayRows = 50
+var maxBrowseRows = 200
 var previewByteLimit = 65536
 
 // Non-hidden junk directories fd would otherwise happily index. Hidden dirs
@@ -60,12 +61,14 @@ function shellQuote(value) {
   return "'" + String(value || "").replace(/'/g, "'\\''") + "'"
 }
 
-// One fd per search dir so a missing directory cannot sink the others, then
-// substring filtering for ignored paths before anything reaches QML memory.
+// One fd pass per search dir for files and another for directories so a
+// missing directory cannot sink the others; directories carry a trailing "/"
+// through the pipeline as their type marker.
 function buildScanCommand(dirs, patterns) {
   var parts = []
   for (var i = 0; i < dirs.length; i++) {
-    parts.push("fd --type f --absolute-path . " + shellQuote(dirs[i]) + " 2>/dev/null")
+    parts.push("fd --type file --absolute-path . " + shellQuote(dirs[i]) + " 2>/dev/null"
+      + " ; fd --type directory --absolute-path . " + shellQuote(dirs[i]) + " 2>/dev/null | sed 's|[^/]$|&/|'")
   }
   var script = "( " + parts.join(" ; ") + " ) 2>/dev/null"
   var clean = []
@@ -79,6 +82,17 @@ function buildScanCommand(dirs, patterns) {
   }
   script += " | head -n " + maxScanResults
   return ["bash", "-c", script]
+}
+
+// Non-recursive snapshot of one directory, directories first. Shown when the
+// query is empty so the finder opens as a browser of ~/Downloads.
+function buildBrowseCommand(dir) {
+  return ["bash", "-c",
+    "{ [ -d " + shellQuote(dir) + " ] || exit 0 ; } ; "
+    + "( fd --type directory --absolute-path --min-depth 1 --max-depth 1 . " + shellQuote(dir) + " 2>/dev/null | sed 's|[^/]$|&/|'"
+    + " ; fd --type file --absolute-path --min-depth 1 --max-depth 1 . " + shellQuote(dir) + " 2>/dev/null )"
+    + " | head -n " + maxBrowseRows
+  ]
 }
 
 function buildSearchCommand(listPath, query) {
@@ -103,6 +117,19 @@ function buildPreviewCommand(path) {
   ]
 }
 
+// Directory preview: "\t-2\t<entry-count>" header, then a one-level listing
+// where nested directories keep their trailing slash.
+function buildDirPreviewCommand(path) {
+  var quoted = shellQuote(path)
+  return [
+    "bash", "-c",
+    "{ [ -d " + quoted + " ] || exit 0 ; } ;"
+    + ' cnt=$(ls -1A -- ' + quoted + ' 2>/dev/null | wc -l);'
+    + ' printf "\\t-2\\t%s\\n" "$cnt";'
+    + " ls -1Ap --color=never -- " + quoted + " 2>/dev/null | head -c " + previewByteLimit
+  ]
+}
+
 function parsePreviewOutput(raw) {
   var text = String(raw || "")
   var newline = text.indexOf("\n")
@@ -117,6 +144,20 @@ function parsePreviewOutput(raw) {
 function fileName(path) {
   var parts = String(path || "").split("/")
   return parts.length > 0 ? parts[parts.length - 1] : String(path || "")
+}
+
+// Directory rows carry a trailing "/" marker through the pipeline.
+function isDirPath(path) {
+  var value = String(path || "")
+  return value.length > 1 && value.charAt(value.length - 1) === "/"
+}
+
+// Strips every trailing slash; fd emits them itself on symlinked roots, so
+// the type-marker sed must stay idempotent against that.
+function cleanPath(path) {
+  var value = String(path || "")
+  while (value.length > 1 && value.charAt(value.length - 1) === "/") value = value.slice(0, -1)
+  return value
 }
 
 function dirName(path) {
@@ -157,6 +198,7 @@ if (typeof module !== "undefined") {
   module.exports = {
     maxScanResults: maxScanResults,
     maxDisplayRows: maxDisplayRows,
+    maxBrowseRows: maxBrowseRows,
     previewByteLimit: previewByteLimit,
     builtinIgnoreNames: builtinIgnoreNames,
     setting: setting,
@@ -167,11 +209,15 @@ if (typeof module !== "undefined") {
     ignorePatterns: ignorePatterns,
     shellQuote: shellQuote,
     buildScanCommand: buildScanCommand,
+    buildBrowseCommand: buildBrowseCommand,
     buildSearchCommand: buildSearchCommand,
     buildPreviewCommand: buildPreviewCommand,
+    buildDirPreviewCommand: buildDirPreviewCommand,
     parsePreviewOutput: parsePreviewOutput,
     fileName: fileName,
     dirName: dirName,
+    isDirPath: isDirPath,
+    cleanPath: cleanPath,
     shortenPath: shortenPath,
     isImagePath: isImagePath,
     formatBytes: formatBytes

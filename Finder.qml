@@ -21,6 +21,7 @@ Item {
 
   property int scanSerial: 0
   property int searchSerial: 0
+  property int browseSerial: 0
   property int previewSerial: 0
   property bool previewIsImage: false
   property string previewSource: ""
@@ -49,6 +50,9 @@ Item {
   readonly property string home: Quickshell.env("HOME")
   readonly property string pluginId: manifest && manifest.id ? String(manifest.id) : "shafayet.finder"
   readonly property string listPath: home + "/.local/state/omarchy/file-finder-list.txt"
+  // Shown instead of nothing while the query is empty, so opening the finder
+  // doubles as a browser of recent downloads.
+  readonly property string browseDir: home + "/Downloads"
 
   // Settings come from this plugin's entry in shell.json plugins[], e.g.
   // { "id": "shafayet.finder", "search_dirs": ["$HOME"], "ignored_dirs": ["$HOME/.cache"] }
@@ -73,6 +77,7 @@ Item {
     root.clearPreview()
     root.rebuildDisplay()
     root.refreshScan()
+    searchDebounce.restart()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -106,12 +111,27 @@ Item {
     if (root.opened && root.filterText.trim()) searchDebounce.restart()
   }
 
+  function startBrowse() {
+    if (browseProc.running) {
+      browseDebounce.restart()
+      return
+    }
+    root.browseSerial++
+    browseProc.revision = root.browseSerial
+    browseProc.command = FinderModel.buildBrowseCommand(root.browseDir)
+    browseProc.running = true
+  }
+
   function requestSearch() {
     if (!root.opened) return
 
     root.searchSerial++
     var query = root.filterText.trim()
-    if (!query || root.fileListCount === 0 || scanProc.running) {
+    if (!query) {
+      root.startBrowse()
+      return
+    }
+    if (root.fileListCount === 0 || scanProc.running) {
       root.searchResults = []
       root.rebuildDisplay()
       return
@@ -127,10 +147,12 @@ Item {
 
     displayModel.clear()
     for (var i = 0; i < rows.length; i++) {
-      var path = rows[i]
+      var marked = rows[i]
+      var isDir = FinderModel.isDirPath(marked)
+      var path = FinderModel.cleanPath(marked)
       displayModel.append({
-        path: path,
-        name: FinderModel.fileName(path),
+        path: marked,
+        name: FinderModel.fileName(path) + (isDir ? "/" : ""),
         dir: FinderModel.dirName(path)
       })
     }
@@ -195,21 +217,21 @@ Item {
     var row = activeRow(index)
     if (!row) return
     root.close()
-    Util.execDetached("xdg-open " + Util.shellQuote(row.path))
+    Util.execDetached("xdg-open " + Util.shellQuote(FinderModel.cleanPath(row.path)))
   }
 
   function copyIndex(index) {
     var row = activeRow(index)
     if (!row) return
     root.close()
-    Util.execDetached('printf "%s" ' + Util.shellQuote(row.path) + ' | wl-copy')
+    Util.execDetached('printf "%s" ' + Util.shellQuote(FinderModel.cleanPath(row.path)) + ' | wl-copy')
   }
 
   function revealIndex(index) {
     var row = activeRow(index)
     if (!row) return
     root.close()
-    Util.execDetached("nautilus --select " + Util.shellQuote(row.path))
+    Util.execDetached("nautilus --select " + Util.shellQuote(FinderModel.cleanPath(row.path)))
   }
 
   function clearPreview() {
@@ -226,10 +248,25 @@ Item {
       return
     }
 
-    if (FinderModel.isImagePath(row.path)) {
+    var marked = row.path
+
+    if (FinderModel.isDirPath(marked)) {
+      root.previewIsImage = false
+      if (previewProc.running) {
+        previewDebounce.restart()
+        return
+      }
+      root.previewSerial++
+      previewProc.revision = root.previewSerial
+      previewProc.command = FinderModel.buildDirPreviewCommand(FinderModel.cleanPath(marked))
+      previewProc.running = true
+      return
+    }
+
+    if (FinderModel.isImagePath(marked)) {
       root.previewSerial++
       root.previewIsImage = true
-      root.previewSource = Util.fileUrl(row.path)
+      root.previewSource = Util.fileUrl(marked)
       root.previewMeta = ""
       root.previewContent = ""
       return
@@ -244,7 +281,7 @@ Item {
       return
     }
     previewProc.revision = root.previewSerial
-    previewProc.command = FinderModel.buildPreviewCommand(row.path)
+    previewProc.command = FinderModel.buildPreviewCommand(marked)
     previewProc.running = true
   }
 
@@ -289,6 +326,31 @@ Item {
     onTriggered: root.requestSearch()
   }
 
+  Timer {
+    id: browseDebounce
+    interval: 120
+    onTriggered: root.startBrowse()
+  }
+
+  Process {
+    id: browseProc
+    property int revision: 0
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (browseProc.revision !== root.browseSerial) return
+        var rows = []
+        var lines = String(text || "").split("\n")
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i]
+          if (line.length > 4 && line.indexOf("/") === 0) rows.push(line)
+        }
+        root.searchResults = rows
+        root.rebuildDisplay()
+      }
+    }
+  }
+
   Process {
     id: searchProc
     property int revision: -1
@@ -322,6 +384,12 @@ Item {
       onStreamFinished: {
         if (previewProc.revision !== root.previewSerial) return
         var parsed = FinderModel.parsePreviewOutput(text)
+        if (parsed.size === -2) {
+          var items = parseInt(parsed.mtime, 10)
+          root.previewMeta = "Directory — " + (isNaN(items) ? "?" : items) + " items"
+          root.previewContent = parsed.content
+          return
+        }
         if (parsed.size === -1) {
           root.previewMeta = "Unreadable file"
           root.previewContent = ""
@@ -624,7 +692,7 @@ Item {
             Text {
               text: root.scanning && root.fileListCount === 0
                 ? "Scanning files…"
-                : "No matches for “" + root.filterText + "”"
+                : (!root.filterText.trim() ? "~/Downloads is empty" : "No matches for “" + root.filterText + "”")
               color: root.foreground
               opacity: 0.7
               font.family: root.fontFamily
