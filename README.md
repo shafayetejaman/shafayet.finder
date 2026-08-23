@@ -43,7 +43,8 @@ plugin's `id` to the `plugins` array in `~/.config/omarchy/shell.json`:
       "preview_byte_limit": 65536,
       "preview_cache_limit": 500,
       "preview_workers": 3,
-      "debounce_ms": 120,
+      "debounce_ms": 25,
+      "rescan_interval_ms": 300000,
       "pdf_render_scale": 1200,
       "show_hidden": false,
       "fd_flags": [
@@ -59,6 +60,19 @@ plugin's `id` to the `plugins` array in `~/.config/omarchy/shell.json`:
 Any key you omit keeps its default; unknown keys are ignored. Changes
 hot-reload when you save `shell.json`.
 
+### Snappy preset
+
+For the most responsive feel (search results ~30 ms after a keystroke,
+instant cached previews, less background rescanning):
+
+```jsonc
+{
+  "id": "shafayet.finder",
+  "debounce_ms": 25,
+  "rescan_interval_ms": 300000
+}
+```
+
 ### Keys
 
 | Key | Type | Default | Description |
@@ -73,7 +87,8 @@ hot-reload when you save `shell.json`.
 | `preview_byte_limit` | int | `65536` | Bytes of file content or directory listing loaded per preview. |
 | `preview_cache_limit` | int | `500` | LRU entries kept in memory across opens (per shell session). |
 | `preview_workers` | int | `3` | Concurrent preview processes; a slow PDF render never blocks text previews. |
-| `debounce_ms` | int | `120` | Delay between keystroke/selection and its search/preview launch. |
+| `debounce_ms` | int | `40` | Delay between keystroke/selection and its search/preview launch. Stale runs are killed by the next keystroke, so low values stay cheap — `25` feels near-instant. |
+| `rescan_interval_ms` | int | `60000` | Minimum time between full index rescans. Reopening the finder inside this window reuses the fresh index instead of re-walking every root. `0` rescans on every open. |
 | `pdf_render_scale` | int | `1200` | `-scale-to` value passed to `pdftoppm` for page thumbnails. |
 | `show_hidden` | bool | `false` | Skip dot files by default: hidden entries stay out of the index (fd's default) and out of directory previews; `true` adds `--hidden` to classic scans and shows everything. Note fd still surfaces dotfiles explicitly whitelisted in `.gitignore` (like `!.gitkeep`) regardless of this setting. |
 | `fd_flags` | string[] | *(unset)* | **Full override** of the flags given to every `fd` invocation — see below. |

@@ -8,7 +8,8 @@ var maxBrowseRows = 200
 var previewByteLimit = 65536
 var previewCacheLimit = 500
 var previewWorkers = 3
-var debounceMs = 120
+var debounceMs = 40
+var rescanIntervalMs = 60000
 var pdfRenderScale = 1200
 
 // Non-hidden junk directories fd would otherwise happily index. Hidden dirs
@@ -122,6 +123,7 @@ function resolveSettings(settings, home) {
     previewCacheLimit: positiveInt(settings, "preview_cache_limit", previewCacheLimit),
     previewWorkers: positiveInt(settings, "preview_workers", previewWorkers),
     debounceMs: nonNegativeInt(settings, "debounce_ms", debounceMs),
+    rescanIntervalMs: nonNegativeInt(settings, "rescan_interval_ms", rescanIntervalMs),
     pdfRenderScale: positiveInt(settings, "pdf_render_scale", pdfRenderScale),
     showHidden: boolSetting(settings, "show_hidden", false),
     // Classic mode: user flags add to the builder-owned type selection.
@@ -458,6 +460,7 @@ if (typeof module !== "undefined") {
     previewCacheLimit: previewCacheLimit,
     previewWorkers: previewWorkers,
     debounceMs: debounceMs,
+    rescanIntervalMs: rescanIntervalMs,
     pdfRenderScale: pdfRenderScale,
     builtinIgnoreNames: builtinIgnoreNames,
     termRelay: termRelay,

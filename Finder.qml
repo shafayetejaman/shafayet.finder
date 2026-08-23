@@ -23,6 +23,7 @@ Item {
   property int searchSerial: 0
   property int browseSerial: 0
   property bool scanQueued: false
+  property double lastScanFinishedAt: 0
   property bool previewIsImage: false
   property bool previewIsVideo: false
   property string previewSource: ""
@@ -129,6 +130,13 @@ Item {
   // fully exits, so a fresh run requested mid-teardown queues itself and
   // starts from onExited instead of being silently dropped.
   function refreshScan() {
+    var now = Date.now()
+    if (!scanProc.running && !root.scanQueued && root.lastScanFinishedAt
+        && now - root.lastScanFinishedAt < root.cfg.rescanIntervalMs) {
+      // The index was rebuilt moments ago — skip the churn and keep serving
+      // the existing list; the next open past the interval rescans.
+      return
+    }
     root.scanSerial++
     scanProc.revision = root.scanSerial
     root.scanning = true
@@ -147,6 +155,7 @@ Item {
   function applyScan(raw) {
     var text = String(raw || "")
     root.fileListCount = FinderModel.markDirectories(text).length
+    root.lastScanFinishedAt = Date.now()
     root.scanning = false
     listFile.setText(text)
     if (root.opened && root.filterText.trim()) searchDebounce.restart()
@@ -655,9 +664,68 @@ Item {
     }
   }
 
+  // Tries to render the selected row without spawning anything: images and
+  // videos are direct sources, and dir/file/PDF previews may already sit in
+  // the LRU (prefetched neighbors, revisits). Returns false when a worker
+  // would be needed, letting the caller fall back to the debounce. Mirrors
+  // the instant branches of requestPreview().
+  function showCachedPreview() {
+    if (!root.opened || displayModel.count === 0) {
+      root.clearPreview()
+      return true
+    }
+    var row = activeRow(root.selectedIndex)
+    if (!row) return false
+    var marked = row.path
+
+    if (FinderModel.isVideoPath(marked)) {
+      root.previewIsImage = false
+      root.previewIsVideo = true
+      root.previewSource = ""
+      root.previewMeta = ""
+      root.previewContent = ""
+      root.prefetchNeighbors()
+      return true
+    }
+    if (FinderModel.isImagePath(marked)) {
+      root.previewIsImage = true
+      root.previewIsVideo = false
+      root.previewSource = Util.fileUrl(marked)
+      root.previewMeta = ""
+      root.previewContent = ""
+      root.prefetchNeighbors()
+      return true
+    }
+    root.previewIsVideo = false
+    root.previewIsImage = false
+
+    var hit = null
+    var isDir = FinderModel.isDirPath(marked)
+    if (isDir) {
+      hit = root.cachedPreview(FinderModel.cleanPath(marked))
+    } else if (FinderModel.isPdfPath(marked)) {
+      var pdfHit = root.pdfCache[FinderModel.cleanPath(marked)]
+      if (pdfHit) {
+        root.previewIsImage = true
+        root.previewSource = root.pdfSourceUrl(pdfHit.ver)
+        root.previewMeta = ""
+        root.previewContent = ""
+        return true
+      }
+      return false
+    } else {
+      hit = root.cachedPreview(marked)
+    }
+    if (!hit) return false
+    root.previewMeta = hit.meta
+    root.previewContent = hit.content
+    root.prefetchNeighbors()
+    return true
+  }
+
   onSelectedIndexChanged: {
     root.killPreviewWorkers()
-    previewDebounce.restart()
+    if (!root.showCachedPreview()) previewDebounce.restart()
   }
 
   PanelWindow {
