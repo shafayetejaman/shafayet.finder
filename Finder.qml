@@ -39,6 +39,13 @@ Item {
   readonly property string pdfPngBase: home + "/.local/state/omarchy/file-finder-pdf"
   readonly property string pdfPngPath: pdfPngBase + ".png"
   property var pdfCache: ({})
+  // Qt's image cache keys on the URL, and every render lands on the same
+  // file — without a version bump a second PDF would keep showing the first.
+  property int pdfRenderVersion: 0
+
+  function pdfSourceUrl(version) {
+    return Util.fileUrl(root.pdfPngPath) + "?v=" + version
+  }
 
   // Shares the [menu] surface tokens — themes that style the menu also
   // style the finder, matching the clipboard overlay's approach.
@@ -294,6 +301,9 @@ Item {
         return
       }
       if (previewProc.running) {
+        // Invalidate the in-flight run so it can never land for this
+        // selection, then retry once it exits.
+        root.previewSerial++
         previewDebounce.restart()
         return
       }
@@ -310,12 +320,15 @@ Item {
       var pdfHit = root.pdfCache[cleanPdf]
       if (pdfHit) {
         root.previewIsImage = true
-        root.previewSource = pdfHit.source
+        root.previewSource = root.pdfSourceUrl(pdfHit.ver)
         root.previewMeta = pdfHit.meta
         root.previewContent = ""
         return
       }
       if (previewProc.running) {
+        // Invalidate the in-flight render so its result can never land for
+        // this (different) selection, then retry once it exits.
+        root.previewSerial++
         previewDebounce.restart()
         return
       }
@@ -354,13 +367,15 @@ Item {
       return
     }
     if (previewProc.running) {
-      // A Process ignores a command change while running; retry once it exits
-      // rather than silently losing this selection's preview.
+      // A Process ignores a command change while running: invalidate whatever
+      // is in flight so its result cannot land for this selection, then retry.
+      root.previewSerial++
       previewDebounce.restart()
       return
     }
     root.previewSerial++
     previewProc.revision = root.previewSerial
+    previewProc.kind = "file"
     previewProc.currentPath = marked
     previewProc.command = FinderModel.buildPreviewCommand(marked)
     previewProc.running = true
@@ -478,11 +493,12 @@ Item {
           var pages = parseInt(parsed.mtime, 10)
           if (!isNaN(pages) && pages > 0) label += " · " + pages + (pages === 1 ? " page" : " pages")
           if (parsed.size > 0) label += " · " + FinderModel.formatBytes(parsed.size)
+          root.pdfRenderVersion++
           root.previewIsImage = true
-          root.previewSource = Util.fileUrl(root.pdfPngPath)
+          root.previewSource = root.pdfSourceUrl(root.pdfRenderVersion)
           root.previewMeta = label
           root.previewContent = ""
-          root.pdfCache[previewProc.currentPath] = { meta: label, source: root.previewSource }
+          root.pdfCache[previewProc.currentPath] = { meta: label, ver: root.pdfRenderVersion }
           return
         }
         if (parsed.size === -2) {
