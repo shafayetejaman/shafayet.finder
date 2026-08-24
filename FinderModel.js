@@ -360,6 +360,24 @@ function markDirectories(raw) {
   return out
 }
 
+// Count-only twin of markDirectories() for callers that merely display the
+// entry total: no output array, no per-line regex substitution, and line
+// scanning via indexOf so no per-line strings are built at all.
+function countPaths(raw) {
+  var text = String(raw || "")
+  var count = 0
+  var start = 0
+  var len = text.length
+  while (start <= len) {
+    var nl = text.indexOf("\n", start)
+    var end = nl === -1 ? len : nl
+    if (end - start > 1 && text.charCodeAt(start) === 47) count++
+    if (nl === -1) break
+    start = nl + 1
+  }
+  return count
+}
+
 // Empty-query browse snapshot of one directory. The classify snippet orders
 // directories first without trusting the walk order.
 function browseCommandClassic(cfg) {
@@ -507,14 +525,24 @@ function liveFdCommand(cfg, parsed, cap) {
 
 // Identity of a live-fd run's expensive inputs. Deliberately excludes
 // fzfQuery: changing only staged text must count as the same run.
+// The settings signature is memoized on config object identity — QML rebuilds
+// cfg only when shell.json changes, so per-keystroke calls skip re-stringifying
+// every array. Mutating cfg in place would stale the memo; nothing does.
+var fdSigMemo = { cfg: null, sig: "" }
+
+function fdConfigSignature(cfg) {
+  if (!cfg) return ""
+  if (fdSigMemo.cfg === cfg) return fdSigMemo.sig
+  var sig = JSON.stringify([cfg.searchDirs, cfg.ignoredDirs, cfg.ignoreNames, cfg.showHidden,
+    cfg.fdFlags, cfg.fdOverrideArgs])
+  fdSigMemo.cfg = cfg
+  fdSigMemo.sig = sig
+  return sig
+}
+
 function fdCacheKey(cfg, parsed) {
   if (!parsed || !parsed.args || parsed.args.length === 0 || !parsed.fdPattern) return ""
-  var sig = null
-  if (cfg) {
-    sig = [cfg.searchDirs, cfg.ignoredDirs, cfg.ignoreNames, cfg.showHidden,
-      cfg.fdFlags, cfg.fdOverrideArgs]
-  }
-  return JSON.stringify([parsed.args, parsed.fdPattern, sig])
+  return JSON.stringify([parsed.args, parsed.fdPattern, fdConfigSignature(cfg)])
 }
 
 // Smart-case subsequence score for one term: contiguity and boundary bonuses;
@@ -558,12 +586,19 @@ function isWordChar(c) {
 }
 
 // fzf --filter-style filter: whitespace terms AND together independently;
-// ties keep input order. Blank query passes everything through.
-function fuzzyFilterRows(rows, query) {
+// ties keep input order. Blank query passes everything through. With a
+// positive finite limit only the best <limit> rows survive: candidates are
+// streamed past a bounded top-N selector whose strict-greater replacement
+// keeps the output identical to sorting everything and slicing, without the
+// full scored array or sort (the warm path runs this per keystroke over
+// six-figure baselines).
+function fuzzyFilterRows(rows, query, limit) {
   var list = Array.isArray(rows) ? rows : []
+  var capped = typeof limit === "number" && isFinite(limit) && limit > 0
   var terms = String(query == null ? "" : query).trim().split(/\s+/).filter(function (t) { return t })
-  if (terms.length === 0) return list.slice()
-  var scored = []
+  if (terms.length === 0) return capped ? list.slice(0, limit) : list.slice()
+  var best = []
+  var minAt = -1
   for (var i = 0; i < list.length; i++) {
     var total = 0
     var miss = false
@@ -572,12 +607,44 @@ function fuzzyFilterRows(rows, query) {
       if (s < 0) { miss = true; break }
       total += s
     }
-    if (!miss) scored.push({ row: list[i], score: total, i: i })
+    if (miss) continue
+    if (!capped || best.length < limit) {
+      best.push({ row: list[i], score: total, i: i })
+      // Track the eviction candidate: lowest score, highest index — exactly
+      // the entry a full stable sort would place last inside the cap.
+      if (capped && (minAt < 0 || total <= best[minAt].score)) minAt = best.length - 1
+    } else if (total > best[minAt].score) {
+      // Later indexes lose ties by construction, so equal scores never
+      // displace an incumbent.
+      best[minAt] = { row: list[i], score: total, i: i }
+      minAt = 0
+      for (var k = 1; k < best.length; k++) {
+        var bScore = best[k].score
+        if (bScore < best[minAt].score || (bScore === best[minAt].score && best[k].i > best[minAt].i)) minAt = k
+      }
+    }
   }
-  scored.sort(function (a, b) { return b.score - a.score || a.i - b.i })
+  best.sort(function (a, b) { return b.score - a.score || a.i - b.i })
   var out = []
-  for (var j = 0; j < scored.length; j++) out.push(scored[j].row)
+  for (var j = 0; j < best.length; j++) out.push(best[j].row)
   return out
+}
+
+// Candidate set for the warm refilter. While typing EXTENDS the previous
+// staged text, every term of the longer query either extends a term of the
+// shorter one or is brand new, so whatever matched before is exactly the
+// plausible universe — narrowing never needs a baseline pass. Backspace,
+// mid-text edits and prefix breaks widen and must rescan. An incomplete
+// cache (the previous pass hit its cap, so matches beyond it are unknown)
+// and a blank predecessor also refuse; an empty match list stays usable
+// since zero matches stay zero under narrowing.
+function warmCandidates(matches, prevStaged, nextStaged, complete) {
+  if (!complete || !Array.isArray(matches)) return null
+  var prev = String(prevStaged == null ? "" : prevStaged)
+  if (!prev) return null
+  var next = String(nextStaged == null ? "" : nextStaged)
+  if (next.indexOf(prev) !== 0) return null
+  return matches
 }
 
 // Wire: "\t<size>\t<mtime>\n" followed by content. Size -1 marks an
@@ -845,8 +912,10 @@ if (typeof module !== "undefined") {
     liveFdCommand: liveFdCommand,
     fdCacheKey: fdCacheKey,
     fuzzyFilterRows: fuzzyFilterRows,
+    warmCandidates: warmCandidates,
     deleteLastWord: deleteLastWord,
     markDirectories: markDirectories,
+    countPaths: countPaths,
     buildSearchCommand: buildSearchCommand,
     buildPreviewCommand: buildPreviewCommand,
     buildDirPreviewCommand: buildDirPreviewCommand,

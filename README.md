@@ -1,10 +1,9 @@
 # File Finder (shafayet.finder)
 
 Fuzzy file finder overlay for the Omarchy shell with live previews: text
-heads, directory listings, images, PDF first-page renders, and video frame grabs.
+heads, directory listings, images, PDF first pages, and video frame grabs.
 
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/8c5db8a4-c0ad-4921-a1db-7de8608835be" />
-
 
 https://github.com/user-attachments/assets/c07ae865-26f7-41d2-b890-42eb8456685f
 
@@ -22,43 +21,43 @@ omarchy plugin remove shafayet.finder
 
 ## Dependencies
 
-| Tool                                                        | Preinstalled with Omarchy | Needed for                        | Install if missing                  |
-| ----------------------------------------------------------- | ------------------------- | --------------------------------- | ----------------------------------- |
-| `fd`                                                        | Yes                       | Search index and flag-mode queries | `sudo pacman -S --needed fd`       |
-| `fzf`                                                       | Yes                       | Fuzzy ranking of results          | `sudo pacman -S --needed fzf`       |
-| [`poppler`](https://poppler.freedesktop.org/) (`pdftoppm`)  | No                        | PDF page thumbnails               | `sudo pacman -S --needed poppler`   |
-| `ffmpeg`                                                    | No                        | Video frame previews              | `sudo pacman -S --needed ffmpeg`    |
-| [`trash-cli`](https://github.com/andreafrancia/trash-cli)   | No                        | Delete-to-trash keybind           | `sudo pacman -S --needed trash-cli` |
+| Tool                                                        | Preinstalled | Needed for                          | Install if missing                   |
+| ----------------------------------------------------------- | ------------ | ----------------------------------- | ------------------------------------ |
+| `fd`                                                        | Yes          | Search index and flag-mode queries  | `sudo pacman -S --needed fd`         |
+| `fzf`                                                       | Yes          | Fuzzy ranking of results            | `sudo pacman -S --needed fzf`        |
+| [`poppler`](https://poppler.freedesktop.org/) (`pdftoppm`)  | No           | PDF page thumbnails                 | `sudo pacman -S --needed poppler`    |
+| `ffmpeg`                                                    | No           | Video frame previews                | `sudo pacman -S --needed ffmpeg`     |
+| [`trash-cli`](https://github.com/andreafrancia/trash-cli)   | No           | Delete-to-trash keybind             | `sudo pacman -S --needed trash-cli`  |
 
-Optional tools degrade gracefully: without them the finder still works, minus
-that one feature (PDF/video previews report unavailable, trash key reports an
-error).
+Optional tools degrade gracefully: the finder works without them, minus that
+one feature.
 
 ## Usage
 
-Open the finder from your configured launcher binding. Keys:
+Open the finder from your configured launcher binding and start typing. With
+an empty query it browses a start directory instead of searching.
 
-| Key                                | Action                                                                                    |
-| ---------------------------------- | ----------------------------------------------------------------------------------------- |
-| printable chars                    | Type to filter                                                                            |
-| `Esc`                              | Clear filter, then close                                                                  |
-| `Ctrl+Backspace`                   | Delete last query word                                                                    |
-| `Up` / `Down`, `Ctrl+J` / `Ctrl+K` | Move selection                                                                            |
-| `PageUp` / `PageDown`              | Move by 6 rows                                                                            |
-| `Home` / `End`                     | First / last row                                                                          |
-| `Enter`                            | Open selection with `xdg-open`                                                            |
-| `Shift+Enter`                      | Copy path                                                                                 |
-| `Alt+Enter`                        | Reveal in file manager                                                                    |
-| `Delete` / `Ctrl+D`                | Move selection to trash (needs [`trash-cli`](https://github.com/andreafrancia/trash-cli)) |
+| Key                                   | Action                                     |
+| ------------------------------------- | ------------------------------------------ |
+| any printable character               | Type to filter                             |
+| `Esc`                                 | Clear filter, then close                   |
+| `Ctrl+Backspace`                      | Delete last query word                     |
+| `Up` / `Down`                         | Move selection                             |
+| `Ctrl+J` / `Ctrl+K`                   | Move selection                             |
+| `PageUp` / `PageDown`                 | Move by 6 rows                             |
+| `Home` / `End`                        | First / last row                           |
+| `Enter`                               | Open with `xdg-open`                       |
+| `Shift+Enter`                         | Copy path                                  |
+| `Alt+Enter`                           | Reveal in file manager                     |
+| `Delete` / `Ctrl+D`                   | Move selection to trash                    |
 
-With an empty query the finder browses a start directory (`~/Downloads`
-by default) instead of searching.
+Trash requires [`trash-cli`](https://github.com/andreafrancia/trash-cli).
 
 ## Configuration
 
-Every setting has a static default — the plugin works with no entry in
-`shell.json` at all. To override any subset, add an entry with this
-plugin's `id` to the `plugins` array in `~/.config/omarchy/shell.json`:
+The plugin works with no configuration. To override anything, add an entry
+with this plugin's `id` to the `plugins` array in
+`~/.config/omarchy/shell.json`:
 
 ```jsonc
 {
@@ -82,9 +81,9 @@ plugin's `id` to the `plugins` array in `~/.config/omarchy/shell.json`:
       "rescan_interval_ms": 300000,
       "pdf_render_scale": 1200,
       "show_hidden": false,
-      "fd_flags": ["--ignore-vcs", "--follow"],
-    },
-  ],
+      "fd_flags": ["--ignore-vcs", "--follow"]
+    }
+  ]
 }
 ```
 
@@ -93,166 +92,125 @@ hot-reload when you save `shell.json`.
 
 ### Snappy preset
 
-For the most responsive feel (search results ~30 ms after a keystroke,
-instant cached previews, less background rescanning):
-
 ```jsonc
 {
   "id": "shafayet.finder",
   "debounce_ms": 25,
   "fd_debounce_ms": 200,
-  "rescan_interval_ms": 300000,
+  "rescan_interval_ms": 300000
 }
 ```
 
-Lowering `fd_debounce_ms` also speeds up flag-mode queries (`--size +5mb …`);
-stale runs are killed on every keystroke, so even aggressive values stay safe.
+Search results land ~30 ms after a keystroke, previews come from cache, and
+background rescanning is rare. Stale runs are killed on every keystroke, so
+aggressive values stay safe.
 
-### Keys
+### Settings
 
-| Key                   | Type     | Default           | Description                                                                                                                                                                                                                                                                                       |
-| --------------------- | -------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `search_dirs`         | string[] | `["$HOME"]`       | Roots scanned into the search index. `$HOME` and leading `~` expand.                                                                                                                                                                                                                              |
-| `ignored_dirs`        | string[] | `[]`              | Paths whose subtree never enters the index. Passed to fd as anchored native excludes, so ignored subtrees are never traversed; a same-named directory elsewhere in the tree is unaffected.                                                                                                        |
-| `ignored_names`       | string[] | `[]`              | Directory/file names to skip anywhere in the tree, merged with the built-ins (`node_modules`, `__pycache__`). Native fd excludes.                                                                                                                                                                 |
-| `browse_dir`          | string   | `$HOME/Downloads` | Directory listed while the query is empty.                                                                                                                                                                                                                                                        |
-| `max_scan_results`    | int      | `100000`          | Cap on indexed paths per scan.                                                                                                                                                                                                                                                                    |
-| `max_display_rows`    | int      | `50`              | Max rows shown for a query.                                                                                                                                                                                                                                                                       |
-| `max_browse_rows`     | int      | `200`             | Max rows shown in empty-query browse mode.                                                                                                                                                                                                                                                        |
-| `preview_byte_limit`  | int      | `65536`           | Bytes of file content or directory listing loaded per preview.                                                                                                                                                                                                                                    |
-| `preview_cache_limit` | int      | `500`             | LRU entries kept in memory across opens (per shell session).                                                                                                                                                                                                                                      |
-| `pdf_cache_limit`     | int      | `12`              | Rendered thumbnails (PDF pages and video frames) kept in memory across opens (LRU). Thumbnails are held as self-contained images, so entries never go stale; raise only if you browse many large documents.                                                                                       |
-| `thumbnail_cache_limit` | int    | `500`             | Rendered thumbnails kept **on disk** per kind in `~/.cache/thumbnails/shafayet.finder/{pdf,video}/`, so a fresh shell session reuses pixels instead of re-running `pdftoppm`/`ffmpeg`. Entries are keyed by `<path|size|mtime|inode>`, so an edited or replaced file never gets a stale hit; the oldest files are pruned after each save. Set to `0` to disable persistence entirely. |
-| `preview_workers` | int | `3` | Concurrent preview processes; a slow PDF render never blocks text previews. Clamped to **1–3**: `1` means strictly serial previews, and more than 3 can never be used (selected row + two prefetched neighbors). |
-| `debounce_ms`         | int      | `40`              | Delay between keystroke/selection and its search/preview launch. Stale runs are killed by the next keystroke, so low values stay cheap — `25` feels near-instant.                                                                                                                                 |
-| `fd_debounce_ms`      | int      | `1000`            | Debounce for flag-mode queries (`--size +5mb …`). These walk real directory trees, so they wait for typing to settle before launching; every keystroke still kills the previous run eagerly.                                                                                                      |
-| `rescan_interval_ms`  | int      | `60000`           | Minimum time between full index rescans. Reopening the finder inside this window reuses the fresh index instead of re-walking every root. `0` rescans on every open.                                                                                                                              |
-| `pdf_render_scale`    | int      | `1200`            | `-scale-to` value passed to `pdftoppm` for page thumbnails; also caps extracted video frame width. Clamped to **64–4000**. |
-| `show_hidden`         | bool     | `false`           | Skip dot files by default: hidden entries stay out of the index (fd's default) and out of directory previews; `true` adds `--hidden` to classic scans and shows everything. Note fd still surfaces dotfiles explicitly whitelisted in `.gitignore` (like `!.gitkeep`) regardless of this setting. |
-| `fd_flags`            | string[] | _(unset)_         | **Full override** of the flags given to every `fd` invocation — see below.                                                                                                                                                                                                                        |
+| Key                       | Type       | Default             | Description                                                            |
+| ------------------------- | ---------- | ------------------- | ---------------------------------------------------------------------- |
+| `search_dirs`             | `string[]` | `["$HOME"]`         | Roots scanned into the index. `$HOME` and leading `~` expand.          |
+| `ignored_dirs`            | `string[]` | `[]`                | Subtrees never indexed (native fd excludes, pruned before traversal).  |
+| `ignored_names`           | `string[]` | `[]`                | Names skipped anywhere, merged with built-ins `node_modules` and `__pycache__`. |
+| `browse_dir`              | `string`   | `$HOME/Downloads`   | Directory listed while the query is empty.                             |
+| `max_scan_results`        | `int`      | `100000`            | Cap on indexed paths per scan.                                         |
+| `max_display_rows`        | `int`      | `50`                | Max rows shown for a query.                                            |
+| `max_browse_rows`         | `int`      | `200`               | Max rows shown in browse mode.                                         |
+| `preview_byte_limit`      | `int`      | `65536`             | Bytes of content loaded per preview.                                   |
+| `preview_cache_limit`     | `int`      | `500`               | In-memory preview LRU entries (per shell session).                     |
+| `pdf_cache_limit`         | `int`      | `12`                | In-memory thumbnail LRU entries (PDF pages and video frames).          |
+| `thumbnail_cache_limit`   | `int`      | `500`               | On-disk thumbnails per kind; `0` disables persistence. See behavior notes. |
+| `preview_workers`         | `int`      | `3`                 | Concurrent preview processes, clamped to `1`–`3`.                      |
+| `debounce_ms`             | `int`      | `40`                | Delay from keystroke/selection to its search/preview launch.           |
+| `fd_debounce_ms`          | `int`      | `1000`              | Debounce for flag-mode queries, which walk real directory trees.       |
+| `rescan_interval_ms`      | `int`      | `60000`             | Minimum time between full rescans; `0` rescans on every open.          |
+| `pdf_render_scale`        | `int`      | `1200`              | `-scale-to` for page thumbnails; also caps video frame width. Clamped `64`–`4000`. |
+| `show_hidden`             | `bool`     | `false`             | Include dot files in scans and directory previews.                     |
+| `fd_flags`                | `string[]` | _(unset)_           | **Full override** of the flags given to every `fd` call — see below.   |
 
-### fd_flags: override semantics
+### fd_flags override semantics
 
-When `fd_flags` is set to a non-empty list, it **replaces the entire flag
-set** the finder would otherwise use — your flags are passed to a single
-`fd` pass verbatim (type selectors included), per search root:
+Setting `fd_flags` replaces the **entire** flag set used for scanning:
 
 ```jsonc
 "fd_flags": ["--ignore-vcs", "--type", "file", "--type", "directory", "--hidden", "--follow"]
 ```
 
-- The finder auto-appends `--absolute-path` if you omit it (the index
-  stores absolute paths; results would be unusable without it).
-- Configured ignores (`ignored_dirs`, `ignored_names`) are always enforced:
-  their native `-E` excludes are appended after your flags, so shell.json
-  policy cannot be defeated by override flags.
-- Flags must make `fd` print paths — avoid `--exec`, `-x`, or quiet modes.
-- Search roots/patterns stay builder-owned; don't pass positional paths.
+- `--absolute-path` is auto-appended if missing (the index stores absolute paths).
+- Configured ignores stay enforced no matter what you set here.
+- Flags must make `fd` print paths; positionals are builder-owned.
 
-When `fd_flags` is unset **or empty**, the classic pipeline runs with this
-baseline, which you can reproduce explicitly:
+Unset or empty falls back to the classic baseline:
 
 ```jsonc
 "fd_flags": ["--type", "file", "--type", "directory", "--absolute-path"]
 ```
 
-plus fd's own defaults on top: hidden entries skipped (unless
-`show_hidden`), VCS ignores respected (`--ignore-vcs` to relax), symlinks
-not followed (`--follow` to relax).
+plus fd's own defaults: hidden entries skipped (unless `show_hidden`), VCS
+ignores respected (`--ignore-vcs` relaxes), symlinks not followed
+(`--follow` relaxes).
 
-### Inline fd flags in the search box
+## Inline fd flags in the search box
 
-Any whitespace-separated token starting with `-` is treated as an **fd
-flag** and routed to a live `fd` walk over the configured `search_dirs`
-(instead of the fuzzy index). The remaining text is staged:
+Any whitespace-separated token starting with `-` routes the query to a live
+`fd` walk over `search_dirs` instead of the fuzzy index. The first remaining
+text token is the fd pattern; the rest is staged text ranked fzf-style.
 
-| Query                        | fd receives                            | fzf receives |
-| ---------------------------- | -------------------------------------- | ------------ |
-| `invoice` _(no flags)_       | — (classic index+fzf path)             | `invoice`    |
-| `--size +5mb invoice`        | flags + pattern `invoice`              | —            |
-| `--size=+5mb report paid`    | attached value + pattern `report`      | `paid`       |
-| `-e pdf .`                   | extension filter + match-all           | —            |
-| `--ext pdf .`                | same — `--ext` is accepted as an alias of `-e` | —    |
-| `-e jpg -e png report`       | repeated extensions + pattern `report` | —            |
-| `-E node_modules report`     | exclude glob + pattern `report`        | —            |
-| `--size +5mb .`              | flags + match-all, scoped to the roots | —            |
-| `--size +5mb` _(flags only)_ | nothing runs; list clears instantly    | —            |
-| `-- -weird`                  | everything after `--` is literal text  | `-weird`     |
+| Query                        | Behavior                                                 |
+| ---------------------------- | -------------------------------------------------------- |
+| `invoice`                    | Classic fuzzy search over the index                       |
+| `--size +5mb invoice`        | Size-filtered walk, pattern `invoice`                     |
+| `--size=+5mb report paid`    | Attached values work; `paid` goes to fzf staging          |
+| `-e pdf .`                   | Extension filter with match-all pattern                   |
+| `--ext pdf .`                | Same — `--ext` aliases `--extension`                      |
+| `-e jpg -e png report`       | Repeated extensions                                       |
+| `-E node_modules report`     | Exclude glob plus pattern                                 |
+| `--size +5mb .`              | Match-all scoped to the scanned roots                     |
+| `--size +5mb`                | Flags only: nothing runs, list clears instantly           |
+| `-- -weird`                  | Everything after `--` is literal text                     |
 
 Notes:
 
-- Size values must use fd's constraint form with the sign **first**:
-  `--size +5mb` (at least 5 MB), `--size -1gb` (at most 1 GB), `--size +2mb -10mb`… fd
-  rejects the trailing form (`--size 2mb+`) outright, which then shows an
-  empty list.
-- Every value flag consumes exactly **one** following token — fd's CLI has no
-  variadic flags. This includes `--size/-S`, `--type/-t`, `--max-depth/-d`,
-  `--min-depth`, `--changed-within`, `--changed-before`, `--max-results`,
-  `--extension`/`--ext`/`-e`, and `--exclude/-E`. Repeat `-e`/`-E` for multiple
-  extensions or globs (`-e pdf -e txt .`), exactly as you would when running
-  fd directly. A bare `--` ends flag parsing; everything after it is literal
-  text. `--ext` (and `--ext=pdf`) is accepted as a finder-side alias for
-  fd's `--extension`, which fd itself does not provide.
-- Unknown flags pass through verbatim; a typo'd flag fails silently and
-  just shows an empty result list.
-- The first text token matches fd-style (smart case); the remaining tokens are
-  the staged query, ranked fzf-style. The flags+pattern walk runs once and its
-  full output is kept in memory: while it stays fixed, **editing the staged
-  text in either direction — adding or deleting words — refilters instantly
-  with no second walk, no debounce, and no clearing**, using an in-process
-  fzf approximation (whitespace terms AND independently, contiguity/boundary
-  scoring). Changing the flags, the pattern, or relevant settings re-walks
-  after `fd_debounce_ms`, which also re-syncs ranking with real fzf.
-- Policy ignores (`ignored_dirs`, `ignored_names`) are always enforced, and
-  `--absolute-path` is forced regardless of what you type.
-- Flag mode reads the live disk, so it works even while the index is still
-  scanning. Previews come from the same cache as everywhere else.
-- Execution flags (`-x`/`--exec`, `-X`/`--exec-batch`) are never passed to
-  `fd`: typing them in the search box demotes them — and everything after
-  them — to literal search text, so the finder can never run commands.
+- Size constraints put the sign first: `--size +5mb`, `--size -1gb`,
+  `--size +2mb -10mb`. fd rejects trailing forms like `--size 2mb+`, which
+  then shows an empty list.
+- Every value flag consumes exactly one following token (`--size/-S`,
+  `--type/-t`, `--max-depth/-d`, `--min-depth`, `--changed-within`,
+  `--changed-before`, `--max-results`, `--extension/--ext/-e`,
+  `--exclude/-E`). Repeat `-e`/`-E` for multiple extensions.
+- Unknown flags pass through verbatim; a typo'd flag shows an empty list.
+- Editing the staged text refilters instantly in memory — no second walk, no
+  debounce. Changing flags or pattern re-walks after `fd_debounce_ms`.
+- Execution flags (`-x`, `--exec`, `-X`, `--exec-batch`) never reach `fd`;
+  typing them demotes them — and everything after — to literal search text.
+- Policy ignores always apply, and flag mode reads the live disk, so it works
+  even while the index is still scanning.
 
 ## Behavior notes
 
-- The path index lives at `~/.local/state/omarchy/file-finder-list.txt`,
-  loads into memory at shell start so first searches are instant, and
-  refreshes in the background.
-- Each rescan is ONE relay-wrapped `fd` walk over every live search root;
-  dead roots are skipped automatically. Directories carry fd's trailing
-  `/` marker through to the UI.
-- With multiple scanned roots, `ignored_dirs` translates to cross-root
-  `**/<suffix>` excludes (fd prunes matching subtrees under any root).
-  Nested or overlapping `search_dirs` are pruned automatically to the
-  outermost containing root, so every path is indexed exactly once no
-  matter how the roots are listed.
-- Preview and PDF caches persist across open/close toggles for the whole
-  shell session; revisiting a file re-shows its preview instantly. Rendered
-  thumbnails (PDF pages and video frames) are kept as in-memory images
-  (bounded by `pdf_cache_limit`), so switching between items always shows
-  each one's own thumbnail. A render larger than 3 MB of PNG is refused and
-  reported as "Thumbnail too large" instead of being loaded, so a crafted
-  document or an extreme `pdf_render_scale` cannot balloon memory; renders
-  happen inside private mode-0700 scratch directories that are removed
-  afterwards.
-- Successful thumbnails also land on disk under
-  `~/.cache/thumbnails/shafayet.finder/{pdf,video}/` (`XDG_CACHE_HOME`
-  honored), named by `md5("<path>|<size>|<mtime>|<inode>")` so an edited
-  source can never produce a stale hit. The first preview of a session is
-  then served straight off disk — no `pdftoppm`/`ffmpeg` run at all. The
-  store is capped per kind by `thumbnail_cache_limit` (oldest pruned after
-  each save); `0` disables it and restores purely in-memory behavior.
-  Oversized or failed renders are never persisted, so retrying still works.
-  The plugin keeps its own subdirectory rather than writing freedesktop-spec
-  entries other apps garbage-collect.
-- Warm flag-mode refiltering scores up to `max_scan_results` rows client-side
-  per keystroke — instant on typical trees; very large walks may add a few ms.
-- Video previews show a representative frame grabbed by `ffmpeg` (1s in,
-  falling back to the first frame for shorter clips) using the same
-  `pdf_render_scale` cap and thumbnail cache as PDFs. Without ffmpeg the
-  preview pane reports the file unreadable; everything else keeps working.
-- A search root listed in `ignored_dirs` is skipped entirely — the whole
-  subtree stays out of the index.
-- Stale work stops eagerly: every keystroke kills superseded search,
-  browse, and preview processes instead of letting them run invisibly.
+- The index lives at `~/.local/state/omarchy/file-finder-list.txt`, loads at
+  shell start so first searches are instant, refreshes in the background, and
+  is rewritten only when its content actually changed.
+- Each rescan is one relay-wrapped `fd` walk over every live root; dead roots
+  are skipped automatically. Nested or overlapping roots collapse to the
+  outermost one, so every path indexes exactly once.
+- `ignored_dirs` translates to cross-root `**/<suffix>` excludes; a root
+  listed there drops out entirely.
+- Previews cache in memory for the whole session, keyed by path, so revisiting
+  a file re-shows its preview instantly. Renders larger than 3 MB of PNG are
+  refused ("Thumbnail too large") rather than loaded.
+- Successful thumbnails persist on disk under
+  `~/.cache/thumbnails/shafayet.finder/{pdf,video}/`, named by
+  `md5("<path>|<size>|<mtime>|<inode>")` so an edited file never gets a stale
+  hit — the first look of a session skips rendering entirely. Oldest entries
+  are pruned past `thumbnail_cache_limit`.
+- Warm staged-text refiltering is incremental: extending the query rescores
+  only the previous match set, keeping keystrokes in the low ms even on
+  six-figure baselines.
+- Video previews grab a frame at 1 s (falling back to the first frame for
+  short clips) using the same scale cap and thumbnail store as PDFs.
+- Stale work stops eagerly: every keystroke kills superseded search, browse,
+  and preview processes instead of letting them run invisibly.
 
 ## Files
 

@@ -199,6 +199,39 @@ eq(M.markDirectories([
 eq(M.markDirectories("/f1\n/f2\n@@DIRS@@\n/d1/\n@@END@@\n/g\n@@DIRS@@\n\n@@END@@\n"),
   ["/f1", "/f2", "/d1/", "/g"], "legacy framed cache format parses unchanged")
 
+// ================= countPaths =================
+
+var parityFixtures = [
+  "/bin",
+  "",
+  "\n",
+  "/f1\n/f2\n@@DIRS@@\n/d1/\n@@END@@\n/g\n@@DIRS@@\n\n@@END@@\n",
+  "@@DIRS@@\n@@END@@",
+  "relative/only\n/mixed/\nrelative2\n/x///\n/y/",
+  "/lonely",
+  "/a\n/b/\n/c\n",
+  "\n\n/a\n\n/b/\n\n",
+]
+for (var fi = 0; fi < parityFixtures.length; fi++) {
+  eq(M.countPaths(parityFixtures[fi]), M.markDirectories(parityFixtures[fi]).length,
+    "countPaths parity with markDirectories, fixture #" + fi)
+}
+// Randomized multi-line text agrees line-for-line too.
+;(function () {
+  var seed = 7
+  function rnd(n) { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n }
+  var lines = []
+  for (var i = 0; i < 500; i++) {
+    var roll = rnd(4)
+    if (roll === 0) lines.push("")
+    else if (roll === 1) lines.push("@@DIRS@@")
+    else if (roll === 2) lines.push("rel/" + i)
+    else lines.push((rnd(2) ? "/" : "//") + "p" + i + (rnd(2) ? "/" : ""))
+  }
+  var text = lines.join("\n")
+  eq(M.countPaths(text), M.markDirectories(text).length, "countPaths parity on random text")
+})()
+
 // ================= search / preview builders =================
 
 var q = M.buildSearchCommand("/tmp/list.txt", "big report", 25)
@@ -343,6 +376,11 @@ ok(M.fdCacheKey(keyCfg, parse("--size +5mb big"))
 eq(M.fdCacheKey(keyCfg, parse("big rest")), "", "classic queries never produce a key")
 eq(M.fdCacheKey(keyCfg, parse("--size +5mb")), "", "flags-only queries never produce a key")
 
+// Memoized settings signature must stay transparent: repeated calls with the
+// same config object keep producing identical keys.
+ok(M.fdCacheKey(keyCfg, parse("--size +5mb x")) === M.fdCacheKey(keyCfg, parse("--size +5mb x")),
+  "memoized signature stays stable across calls")
+
 // ================= fuzzyFilterRows =================
 
 var rows = ["/a/report.txt", "/b/Report Paid.pdf", "/c/rep.xlsx", "/d/paid-report.doc"]
@@ -366,6 +404,55 @@ eq(M.fuzzyFilterRows(["/b/xreport.txt", "/a/report.txt"], "report"),
 eq(M.fuzzyFilterRows(["/b/scatter-r-e-p-o-rt.doc", "/a/report.txt"], "report"),
    ["/a/report.txt", "/b/scatter-r-e-p-o-rt.doc"],
    "multi-start alignment finds the clean run, not the greedy scattered one")
+
+// ================= fuzzyFilterRows: capped selection =================
+
+// The capped pass must equal sort-everything-then-slice, including ties.
+var tieRows = ["/x1/dup", "/x2/dup", "/x3/dup"]
+eq(M.fuzzyFilterRows(tieRows, "dup", 2), ["/x1/dup", "/x2/dup"],
+  "equal scores keep input order under cap")
+var displace = ["/s/t-a-r-g-e-t-x", "/a/target"]
+eq(M.fuzzyFilterRows(displace, "target", 1), ["/a/target"],
+  "late high score displaces early low under cap")
+eq(M.fuzzyFilterRows(displace, "", 1), ["/s/t-a-r-g-e-t-x"], "blank query respects the cap")
+eq(M.fuzzyFilterRows(["/a", "/b"], "a", 5).length, 1, "cap above match count keeps all matches")
+eq(M.fuzzyFilterRows([], "a", 3), [], "capped empty input stays empty")
+
+// Parity over a deterministic pseudo-random corpus: every cap must reproduce
+// the uncapped head exactly, across single and multi-term queries.
+;(function () {
+  var seed = 42
+  function rnd(n) { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n }
+  var pieces = ["rep", "ort", "paid", "2024", "inv", "oice", "pdf", "txt", "doc"]
+  var corpus = []
+  for (var i = 0; i < 400; i++) {
+    var p = "/d" + rnd(9) + "/"
+    for (var k = 0; k < 3; k++) p += pieces[rnd(pieces.length)]
+    corpus.push(p + "." + pieces[rnd(pieces.length)])
+  }
+  var queries = ["rep", "rep ort", "inv pdf", "paid 2024", "p", "doc txt"]
+  var caps = [1, 5, 37, 400]
+  for (var qi = 0; qi < queries.length; qi++) {
+    var full = M.fuzzyFilterRows(corpus, queries[qi])
+    ok(full.length > 0, "corpus query '" + queries[qi] + "' matches something")
+    for (var ci = 0; ci < caps.length; ci++) {
+      eq(M.fuzzyFilterRows(corpus, queries[qi], caps[ci]), full.slice(0, caps[ci]),
+        "cap parity @" + caps[ci] + " q='" + queries[qi] + "'")
+    }
+  }
+})()
+
+// ================= warmCandidates =================
+
+eq(M.warmCandidates(["/a"], "inv", "invo", true), ["/a"], "extension narrows to cached matches")
+eq(M.warmCandidates([], "inv", "invo", true), [], "zero previous matches stay zero while narrowing")
+eq(M.warmCandidates(["/a"], "inv", "inv", true), ["/a"], "identical restage reuses the cache")
+eq(M.warmCandidates(["/a"], "inv", "invoice", false), null, "incomplete cache widens to baseline")
+eq(M.warmCandidates(["/a"], "invo", "inv", true), null, "backspace widens to baseline")
+eq(M.warmCandidates(["/a"], "inv", "nv", true), null, "prefix break widens to baseline")
+eq(M.warmCandidates(["/a"], "", "inv", true), null, "blank predecessor never narrows")
+eq(M.warmCandidates(null, "inv", "invo", true), null, "no cache widens to baseline")
+eq(M.warmCandidates("junk", "inv", "invo", true), null, "non-array cache widens to baseline")
 
 // ================= liveFdCommand =================
 

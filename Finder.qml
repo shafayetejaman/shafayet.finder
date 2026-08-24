@@ -24,11 +24,24 @@ Item {
   property int fdSerial: 0
   property bool scanQueued: false
   property double lastScanFinishedAt: 0
+  // Index-write dedup state: what the on-disk file currently holds and
+  // whether it was actually read from disk (a failed load must not suppress
+  // the first write).
+  property string lastIndexedText: ""
+  property bool lastIndexFromDisk: false
 
   // Identity (fdCacheKey) of the last COMPLETED live-fd walk plus its full
   // baseline; staged-text edits refilter it in memory. Key changes re-walk.
   property string lastFdKey: ""
   property var fdBaseRows: []
+  // Warm-refilter memo: { staged, matches, complete } from the previous pass.
+  // Typing extensions rescore only `matches` instead of the whole baseline;
+  // `complete` is false when the pass hit its cap (unknown tail), forcing a
+  // baseline rescan. Nulled wherever fdBaseRows is reassigned.
+  property var fdWarmCache: null
+  // Cap for full-baseline warm passes: big enough that ordinary match sets
+  // stay complete (and thus narrowable) yet bounded for pathological queries.
+  readonly property int fdWarmCacheCap: Math.max(root.cfg.maxDisplayRows, 2000)
   // Paths deleted this session; filtered out of every result producer so a
   // trashed file never resurfaces before the next index rescan.
   property var trashedPaths: ({})
@@ -118,6 +131,7 @@ Item {
     root.searchResults = []
     root.lastFdKey = ""
     root.fdBaseRows = []
+    root.fdWarmCache = null
   }
 
   function toggle() {
@@ -149,16 +163,24 @@ Item {
 
   function applyScan(raw) {
     var text = String(raw || "")
-    root.fileListCount = FinderModel.markDirectories(text).length
+    root.fileListCount = FinderModel.countPaths(text)
     root.lastScanFinishedAt = Date.now()
     root.scanning = false
-    listFile.setText(text)
+    // Rewriting megabytes of identical index every rescan is pure disk churn;
+    // skip unless the on-disk copy is missing or actually differs.
+    if (!root.lastIndexFromDisk || text !== root.lastIndexedText) {
+      root.lastIndexedText = text
+      listFile.setText(text)
+    }
     if (root.opened && root.filterText.trim()) searchDebounce.restart()
   }
 
-  // Cached index counted at startup so first searches need no rescan.
+  // Cached index counted at startup so first searches need no rescan. The
+  // text is remembered as the on-disk baseline for the write-skip above.
   function loadCachedList(raw) {
-    root.fileListCount = FinderModel.markDirectories(String(raw || "")).length
+    var text = String(raw || "")
+    root.fileListCount = FinderModel.countPaths(text)
+    root.lastIndexedText = text
   }
 
   // Cold-start prewarm stage 1: dispatch row 0's normal preview builder.
@@ -332,13 +354,25 @@ Item {
     return (p.args.length > 0 && p.fdPattern) ? String(p.fzfQuery || "") : ""
   }
 
-  // Warm path: same-key edits land here with zero latency, never clearing rows.
+  // Warm path: same-key edits land here with zero latency, never clearing
+  // rows. Typing extensions rescore only the previous match set; anything
+  // else (first pass, backspace, edits) rescans the baseline under the cap.
   function refreshFlagDisplay() {
-    var rows = FinderModel.fuzzyFilterRows(root.fdBaseRows, fdStagedText())
+    var staged = fdStagedText()
+    var cache = root.fdWarmCache
+    var candidates = FinderModel.warmCandidates(cache ? cache.matches : null,
+      cache ? cache.staged : "", staged, cache ? cache.complete : false)
+    var fullPass = !candidates
+    if (!candidates) candidates = root.fdBaseRows
+    var limit = fullPass ? root.fdWarmCacheCap : root.cfg.maxDisplayRows
+    var rows = FinderModel.fuzzyFilterRows(candidates, staged, limit)
+    // Uncapped-at-limit matches feed the next narrow keystroke; trashed rows
+    // stay a display-only concern so the memo keeps describing the walk.
     var visible = []
     for (var i = 0; i < rows.length; i++) {
       if (!root.trashedPaths[rows[i]]) visible.push(rows[i])
     }
+    root.fdWarmCache = { staged: staged, matches: rows, complete: rows.length < limit }
     root.searchResults = visible.slice(0, root.cfg.maxDisplayRows)
     root.rebuildDisplay()
   }
@@ -356,6 +390,7 @@ Item {
     if (parsed.args.length === 0 || !parsed.fdPattern) {
       root.lastFdKey = ""
       root.fdBaseRows = []
+      root.fdWarmCache = null
     }
     if (parsed.args.length > 0) {
       if (!parsed.fdPattern) {
@@ -629,8 +664,14 @@ Item {
     path: root.listPath
     atomicWrites: true
     printErrors: false
-    onLoaded: root.loadCachedList(text())
-    onLoadFailed: root.loadCachedList("")
+    onLoaded: {
+      root.lastIndexFromDisk = true
+      root.loadCachedList(text())
+    }
+    onLoadFailed: {
+      root.lastIndexFromDisk = false
+      root.loadCachedList("")
+    }
   }
 
   Process {
@@ -724,6 +765,8 @@ Item {
         }
         root.lastFdKey = fdProc.pendingKey
         root.fdBaseRows = rows
+        // Fresh walk, fresh memo: stale matches describe the old baseline.
+        root.fdWarmCache = null
         root.refreshFlagDisplay()
       }
     }
