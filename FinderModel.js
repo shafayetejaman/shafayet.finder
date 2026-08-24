@@ -80,8 +80,21 @@ function hasExecFlag(flags) {
   return false
 }
 
+// fd's --color is long-only and takes at most one value token. Any spelling
+// counts as user-owned; otherwise --color=never is forced everywhere: fd
+// honors CLICOLOR_FORCE even when piped, and ANSI bytes would make index
+// lines fail the leading-"/" check and vanish from searches.
+function hasColorFlag(args) {
+  for (var i = 0; i < args.length; i++) {
+    var flag = String(args[i] || "")
+    if (flag === "--color" || flag.indexOf("--color=") === 0) return true
+  }
+  return false
+}
+
 function fdFlagSegment(flags) {
   var clean = sanitizedFdFlags(flags)
+  if (!hasColorFlag(clean)) clean.push("--color=never")
   var parts = []
   for (var i = 0; i < clean.length; i++) parts.push(shellQuote(clean[i]))
   return parts.length > 0 ? parts.join(" ") + " " : ""
@@ -99,9 +112,10 @@ function shellJoin(args) {
 function fdOverrideArgs(flags) {
   var args = Array.isArray(flags) ? flags.slice() : []
   for (var i = 0; i < args.length; i++) {
-    if (args[i] === "--absolute-path" || args[i] === "-a") return args
+    if (args[i] === "--absolute-path" || args[i] === "-a") break
   }
-  args.push("--absolute-path")
+  if (i === args.length) args.push("--absolute-path")
+  if (!hasColorFlag(args)) args.push("--color=never")
   return args
 }
 
@@ -255,13 +269,25 @@ function combinedExcludeSegment(cfg) {
   return shellJoin(combinedExcludeArgs(cfg.ignoreNames, cfg.ignoredDirs, cfg.searchDirs)).join(" ")
 }
 
+// Emitted to the scan's stderr as "<marker><alive>/<total>"; lets QML tell a
+// partially dead walk (e.g. unmounted HDD shrinking the index to $HOME-only)
+// apart from a full one before trusting its output.
+var scanRootsMarker = "FINDER_ROOTS="
+
 // Bash prologue collecting live roots into __p[], so one dead mount cannot
-// fail the whole walk.
-function guardedRootsSnippet(searchDirs) {
+// fail the whole walk. Runs UNSILENCED at top level: the stderr ratio report
+// must reach the caller, and an all-dead set exits before any pipeline starts.
+function guardedRootsSnippet(searchDirs, reportRatio) {
   var parts = ["__p=()"]
   for (var i = 0; i < searchDirs.length; i++) {
     var quoted = shellQuote(searchDirs[i])
     parts.push("[ -d " + quoted + " ] && __p+=(" + quoted + ")")
+  }
+  // Only index-writing scans report: flag-mode walks never touch the index,
+  // and their stderr would otherwise leak the ratio to the user's terminal.
+  if (reportRatio) {
+    parts.push("printf '%s%s/%s\\n' '" + scanRootsMarker + "' \"${#__p[@]}\" '"
+      + searchDirs.length + "' >&2")
   }
   parts.push("[ ${#__p[@]} -gt 0 ] || exit 0")
   return parts.join(" ; ")
@@ -279,8 +305,8 @@ function scanCommand(cfg, stateDir) {
     var ex = combinedExcludeSegment(cfg)
     return ["bash", "-c",
       pre
-      + "( { " + guardedRootsSnippet(cfg.searchDirs) + " ; "
-      + termRelay("fd " + argStr + (ex ? " " + ex : "") + " . \"${__p[@]}\" 2>/dev/null")
+      + guardedRootsSnippet(cfg.searchDirs, true) + " ; "
+      + "( { " + termRelay("fd " + argStr + (ex ? " " + ex : "") + " . \"${__p[@]}\" 2>/dev/null")
       + " ; } 2>/dev/null ) | head -n " + cfg.maxScanResults]
   }
   return ["bash", "-c", pre + scanCommandClassic(cfg)[2]]
@@ -365,8 +391,8 @@ function scanCommandClassic(cfg) {
   if (ex) flags += ex + " "
   flags += "--absolute-path "
   return ["bash", "-c",
-    "( { " + guardedRootsSnippet(cfg.searchDirs) + " ; "
-    + termRelay("fd " + flags + ". \"${__p[@]}\" 2>/dev/null")
+    guardedRootsSnippet(cfg.searchDirs, true) + " ; "
+    + "( { " + termRelay("fd " + flags + ". \"${__p[@]}\" 2>/dev/null")
     + " ; } 2>/dev/null ) | head -n " + cfg.maxScanResults]
 }
 
@@ -440,6 +466,7 @@ var FD_VALUE_FLAGS = {
   "--max-results": 1,
   "--extension": 1, "-e": 1,
   "--exclude": 1, "-E": 1,
+  "--color": 1,
 }
 
 // Spellings fd rejects, rewritten before any command is built.
@@ -535,6 +562,7 @@ function liveFdCommand(cfg, parsed, cap) {
   if (cfg.showHidden && absArgs.indexOf("--hidden") === -1 && absArgs.indexOf("-H") === -1 && absArgs.indexOf("-u") === -1) {
     absArgs.push("--hidden")
   }
+  if (!hasColorFlag(absArgs)) absArgs.push("--color=never")
   var argStr = shellJoin(absArgs).join(" ")
   var ex = combinedExcludeSegment(cfg)
   var script = "( { " + guardedRootsSnippet(cfg.searchDirs) + " ; "
@@ -903,6 +931,7 @@ if (typeof module !== "undefined") {
     builtinIgnoreNames: builtinIgnoreNames,
     termRelay: termRelay,
     scanSectionMarker: scanSectionMarker,
+    scanRootsMarker: scanRootsMarker,
     setting: setting,
     positiveInt: positiveInt,
     nonNegativeInt: nonNegativeInt,

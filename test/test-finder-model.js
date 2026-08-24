@@ -130,13 +130,16 @@ var classic = M.resolveSettings({
 }, HOME)
 var s = M.scanCommand(classic)[2]
 
-ok(s.indexOf("( { __p=() ;") === 0, "classic scan starts with guarded roots prologue")
+ok(s.indexOf("__p=() ;") === 0, "classic scan starts with guarded roots prologue")
 ok(s.indexOf("[ -d '/r1' ] && __p+=('/r1')") !== -1, "root 1 guarded")
 ok(s.indexOf("[ -d '/r2' ] && __p+=('/r2')") !== -1, "root 2 guarded")
 ok(s.indexOf('[ ${#__p[@]} -gt 0 ] || exit 0') !== -1, "all-dead roots exit cleanly")
+ok(s.indexOf('"${#__p[@]}" \'2\' >&2') !== -1, "live/total root ratio reported on stderr")
+ok(s.indexOf("'FINDER_ROOTS='") < s.indexOf("( { "), "ratio reported before the walk starts")
 eq(fdInvocationCount(s), 1, "classic scan is ONE fd invocation")
 eq(relayCount(s), 1, "classic scan leaf is relay-wrapped once")
 ok(s.indexOf("--type file --type directory") !== -1, "mixed types selected")
+ok(s.indexOf("'--color=never'") !== -1, "color output forced off")
 ok(s.indexOf("--absolute-path . \"${__p[@]}\"") !== -1, "absolute paths, positionals from array")
 ok(s.indexOf("'--exclude' 'tgt'") !== -1, "name exclude present")
 ok(s.indexOf("'--exclude' '**/deep/x'") !== -1, "ignored dir becomes cross-root glob")
@@ -153,7 +156,7 @@ eq(M.scanCommand(M.resolveSettings({ ignored_dirs: ["$HOME"] }, HOME)), ["bash",
 // optional stateDir: folds directory creation into the classic scan command
 // itself so the persisted index never needs a dedicated mkdir process
 s = M.scanCommand(classic, "/state/dir")[2]
-ok(s.indexOf("mkdir -p -- '/state/dir'; ( { __p=() ;") === 0, "classic scan creates state dir first")
+ok(s.indexOf("mkdir -p -- '/state/dir'; __p=() ;") === 0, "classic scan creates state dir first")
 eq(fdInvocationCount(s), 1, "state-dir prefix adds no second fd invocation")
 eq(M.scanCommand(M.resolveSettings({ ignored_dirs: ["$HOME"] }, HOME), "/state/dir"), ["bash", "-c", "mkdir -p -- '/state/dir'; "],
   "no roots still makes the state dir")
@@ -168,6 +171,7 @@ s = M.scanCommand(over)[2]
 eq(fdInvocationCount(s), 1, "override scan is ONE fd invocation")
 ok(s.indexOf("'--hidden'") !== -1, "override flags verbatim")
 ok(s.indexOf("'--absolute-path'") !== -1, "override auto-appends --absolute-path")
+ok(s.indexOf('"${#__p[@]}" \'2\' >&2') !== -1, "override scan reports live roots too")
 ok(s.indexOf("'--exclude' 'node_modules'") !== -1, "policy excludes enforced in override mode")
 ok(s.indexOf(". \"${__p[@]}\"") !== -1, "roots stay builder-owned positionals")
 s = M.scanCommand(over, "/state/dir")[2]
@@ -176,13 +180,18 @@ ok(s.indexOf("mkdir -p -- '/state/dir'; ") === 0 && s.indexOf("fd ") !== -1,
 
 // The short spelling satisfies the forced absolute-path requirement too:
 // a relative-output override walk would index nothing.
-eq(M.fdOverrideArgs(["-a"]), ["-a"], "-a counts as --absolute-path")
-eq(M.fdOverrideArgs(["-a", "-E", "x"]), ["-a", "-E", "x"], "-a kept among other flags verbatim")
-eq(M.fdOverrideArgs(["--ignore-vcs"]), ["--ignore-vcs", "--absolute-path"], "long form still appended when absent")
+eq(M.fdOverrideArgs(["-a"]), ["-a", "--color=never"], "-a counts as --absolute-path; color still forced")
+eq(M.fdOverrideArgs(["-a", "-E", "x"]), ["-a", "-E", "x", "--color=never"], "-a kept among other flags verbatim")
+eq(M.fdOverrideArgs(["--ignore-vcs"]), ["--ignore-vcs", "--absolute-path", "--color=never"],
+  "long form still appended when absent")
+eq(M.fdOverrideArgs(["--color=never"]), ["--color=never", "--absolute-path"], "explicit color spelling owned by user, no duplicate")
+eq(M.fdOverrideArgs(["--color", "always"]), ["--color", "always", "--absolute-path"],
+  "detached value spelling counts as user-owned too")
 var overA = M.resolveSettings({ search_dirs: ["/r1"], fd_flags: ["-a"] }, HOME)
 s = M.scanCommand(overA)[2]
 ok(s.indexOf("'-a'") !== -1 && s.indexOf("absolute-path") === -1,
   "override scan with -a neither duplicates nor appends the long form")
+ok(s.indexOf("'--color=never'") !== -1, "override scan still forces color off")
 
 // ================= fd_flags exec-flag rejection =================
 
@@ -207,6 +216,7 @@ eq(relayCount(b), 1, "browse leaf relay-wrapped")
 ok(b.indexOf("{ [ -d '/tmp/browsethis' ] || exit 0 ; }") !== -1, "missing browse dir exits cleanly")
 ok(b.indexOf("--min-depth 1 --max-depth 1") !== -1, "browse is depth-1 only")
 ok(b.indexOf("@@DIRS@@") !== -1, "dirs-first classify snippet present")
+ok(b.indexOf("'--color=never'") !== -1, "browse forces color off")
 ok(b.indexOf("| head -n 200") !== -1, "browse capped by head")
 
 // ================= markDirectories =================
@@ -496,6 +506,14 @@ ok(/wait "\$__p"/.test(lf), "live leaf relay-wrapped")
 lf = M.liveFdCommand(liveCfg, parse("-e txt ."), 50)[2]
 ok(lf.indexOf("| fzf ") === -1, "no fzf stage without a second text token")
 ok(lf.indexOf("'.' \"${__p[@]}\"") !== -1, "match-all pattern scoped to roots")
+ok(lf.indexOf("'--color=never'") !== -1, "live walk forces color off")
+
+lf = M.liveFdCommand(liveCfg, parse("--color=never -e txt ."), 50)[2]
+eq(lf.split("--color").length - 1, 1, "typed color flag never duplicated")
+lf = M.liveFdCommand(liveCfg, parse("--color always invoice"), 50)[2]
+ok(lf.indexOf("'--color' 'always'") !== -1, "detached value consumed as one flag pair")
+ok(lf.indexOf("'invoice'") !== -1 && lf.indexOf("always invoice") === -1,
+  "value not leaked into staged text")
 
 // defensive: no roots / empty args -> valid no-op
 eq(M.liveFdCommand(M.resolveSettings({ ignored_dirs: ["$HOME"] }, HOME), parse("--size +5mb x"), 50),
@@ -541,7 +559,7 @@ ok(vt.indexOf("grep -v '\\.part$'") !== -1,
   fs.writeFileSync(path.join(live2, "node_modules", "junk.js"), "j")
   fs.writeFileSync(path.join(live2, ".cache", "c.txt"), "c")
 
-  function run(cmd) { return cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" }) }
+  function run(cmd) { return cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }) }
 
   // dead middle root must not sink the others
   var cfg = M.resolveSettings({ search_dirs: [live1, dead, live2] }, HOME)
@@ -563,6 +581,19 @@ ok(vt.indexOf("grep -v '\\.part$'") !== -1,
   cfg = M.resolveSettings({ search_dirs: [live1, live2], max_scan_results: 3 }, HOME)
   rows = M.markDirectories(run(M.scanCommand(cfg)))
   eq(rows.length, 3, "integration: head cap exact")
+
+  // the live/total stderr ratio lets QML refuse partial-walk index writes
+  function runWithStderr(cmd) {
+    return cp.spawnSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+  }
+  var partial = runWithStderr(M.scanCommand(M.resolveSettings({ search_dirs: [live1, dead] }, HOME)))
+  ok(partial.stderr.indexOf(M.scanRootsMarker + "1/2") !== -1,
+    "integration: one dead root reports 1/2")
+  ok(M.markDirectories(partial.stdout).indexOf(path.join(live1, "a.txt")) !== -1,
+    "integration: surviving root still walked")
+  var allDead = runWithStderr(M.scanCommand(M.resolveSettings({ search_dirs: [dead, dead + "/x"] }, HOME)))
+  ok(allDead.stderr.indexOf(M.scanRootsMarker + "0/2") !== -1 && allDead.stdout === "",
+    "integration: all-dead walk reports 0/N and empty output")
 
   // browse: dirs first, depth 1
   cfg = M.resolveSettings({ browse_dir: live1 }, HOME)
@@ -800,7 +831,8 @@ ok(vt.indexOf("grep -v '\\.part$'") !== -1,
   var base = fs.mkdtempSync(path.join(os.tmpdir(), "finder-inj-"))
   function sentinel(n) { return path.join(base, n) }
   function run(cmd) {
-    var out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8", cwd: base })
+    var out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]],
+      { encoding: "utf8", cwd: base, stdio: ["ignore", "pipe", "pipe"] })
     return out
   }
   function assertInert(name) {

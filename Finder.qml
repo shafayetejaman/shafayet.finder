@@ -29,6 +29,8 @@ Item {
   // the first write).
   property string lastIndexedText: ""
   property bool lastIndexFromDisk: false
+  // Consecutive refused (dead/partial) walks; drives the bounded self-retry.
+  property int scanRefusals: 0
 
   // Identity (fdCacheKey) of the last COMPLETED live-fd walk plus its full
   // baseline; staged-text edits refilter it in memory. Key changes re-walk.
@@ -125,6 +127,9 @@ Item {
     // disk, so even a session's first look skips pdftoppm/ffmpeg.
     root.rebuildDisplay(true)
     root.refreshScan()
+    // External deletion of the index is invisible to FileView; searches pipe
+    // fzf from this path, so verify it still exists each open.
+    if (root.lastIndexFromDisk && !indexProbeProc.running) indexProbeProc.running = true
     searchDebounce.restart()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
@@ -171,15 +176,31 @@ Item {
     scanProc.running = true
   }
 
-  function applyScan(raw) {
+  function applyScan(raw, scanStderr) {
     var text = String(raw || "")
-    // An all-dead scan (every root unmounted or gone) must never clobber the
-    // good on-disk index: keep serving it until a real walk succeeds again.
-    if (!text && root.lastIndexFromDisk && root.lastIndexedText) {
-      root.lastScanFinishedAt = Date.now()
-      root.scanning = false
+    // A partially dead walk indexes only the surviving roots — an unmounted
+    // HDD would shrink the index to $HOME-only — and is never persisted, even
+    // when no index exists yet: staying empty beats shipping wrong results.
+    // Full walks always land.
+    var ratio = String(scanStderr || "").match(new RegExp(FinderModel.scanRootsMarker + "(\\d+)/(\\d+)"))
+    var partial = !!ratio && parseInt(ratio[1], 10) < parseInt(ratio[2], 10)
+    if (!text || partial) {
+      // Keep the "scanning…" indicator up across retries: with no usable
+      // index, "scanning" is the honest state until a full walk lands.
+      root.scanning = true
+      // Deliberately no lastScanFinishedAt bump: the next open must be able
+      // to rescan immediately instead of waiting out the success interval.
+      root.scanRefusals++
+      if (root.scanRefusals <= 24) {
+        partialScanRetry.restart()
+      } else {
+        // Give up quietly: a permanently absent root must not spin forever.
+        root.scanning = false
+      }
       return
     }
+    root.scanRefusals = 0
+    partialScanRetry.stop()
     root.fileListCount = FinderModel.countPaths(text)
     root.lastScanFinishedAt = Date.now()
     root.scanning = false
@@ -679,6 +700,7 @@ Item {
     if (fileHit) {
       root.previewMeta = fileHit.meta
       root.previewContent = fileHit.content
+      root.previewUnavailable = fileHit.content === ""
       root.prefetchNeighbors()
       return
     }
@@ -721,6 +743,19 @@ Item {
   }
 
   Process {
+    id: indexProbeProc
+    command: ["bash", "-c", "[ -f " + FinderModel.shellQuote(root.listPath) + " ]"]
+    onExited: {
+      if (exitCode === 0 || !root.lastIndexFromDisk) return
+      // Deleted mid-session: restore the in-memory copy so fzf keeps serving
+      // immediately, and let the next landed scan rewrite it fresh (the flag
+      // drop makes applyScan's write unconditional).
+      root.lastIndexFromDisk = false
+      if (root.lastIndexedText) listFile.setText(root.lastIndexedText)
+    }
+  }
+
+  Process {
     id: trashProbeProc
     command: ["bash", "-c", "command -v trash-put >/dev/null 2>&1"]
     onExited: root.trashAvailable = exitCode === 0
@@ -745,13 +780,14 @@ Item {
   Process {
     id: scanProc
     property int revision: 0
-    onExited: root.startScan()
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        if (scanProc.revision === root.scanSerial) root.applyScan(text)
-      }
+    // Both collectors settle before exit; reading them there keeps the roots
+    // ratio and the walk's stdout from racing each other.
+    onExited: {
+      if (revision === root.scanSerial) root.applyScan(stdout.text, stderr.text)
+      root.startScan()
     }
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
   }
 
   Timer {
@@ -771,6 +807,15 @@ Item {
     id: browseDebounce
     interval: root.cfg.debounceMs
     onTriggered: root.startBrowse()
+  }
+
+  // Heals a boot-time mount race without user interaction: refused walks
+  // re-scan every 10s for up to ~4 minutes, then yield to the normal
+  // open-triggered cadence so a permanently absent root cannot hot-loop.
+  Timer {
+    id: partialScanRetry
+    interval: 10000
+    onTriggered: root.refreshScan()
   }
 
   Process {
@@ -932,11 +977,14 @@ Item {
   function finishPreview(worker, rawOutput) {
     if (!root.opened || worker.cancelled) return
     var parsed = FinderModel.parsePreviewOutput(rawOutput)
+    // No header at all means the producer itself died (killed worker,
+    // vanished target): indistinguishable from an unreadable file.
+    var deadProducer = parsed.size === 0 && parsed.mtime === "" && parsed.content === ""
     var selectedRow = activeRow(root.selectedIndex)
     var isSelected = selectedRow !== null && worker.displayKey !== "" && worker.displayKey === selectedRow.path
 
     if (worker.kind === "pdf" || worker.kind === "video") {
-      if (parsed.size === -1) {
+      if (parsed.size === -1 || deadProducer) {
         if (isSelected) {
           root.previewIsImage = false
           root.previewUnavailable = true
@@ -976,7 +1024,7 @@ Item {
       }
       return
     }
-    if (parsed.size === -1) {
+    if (parsed.size === -1 || deadProducer) {
       // Uncached so a reappearance gets a fresh attempt.
       if (isSelected) {
         root.previewUnavailable = true
@@ -999,6 +1047,9 @@ Item {
     if (isSelected) {
       root.previewMeta = meta
       root.previewContent = content
+      // Binary and zero-byte files have nothing renderable: keep their size
+      // caption but surface the placeholder instead of a blank pane.
+      root.previewUnavailable = content === ""
     }
   }
 
@@ -1057,6 +1108,9 @@ Item {
     if (!hit) return false
     root.previewMeta = hit.meta
     root.previewContent = hit.content
+    // Empty directories preview fine (the caption says so); files with no
+    // renderable content show the placeholder.
+    root.previewUnavailable = !isDir && hit.content === ""
     root.prefetchNeighbors()
     return true
   }

@@ -137,13 +137,16 @@ Setting `fd_flags` replaces the **entire** flag set used for scanning:
 ```
 
 - `--absolute-path` is auto-appended if missing (the index stores absolute paths).
+- `--color=never` is auto-appended if missing: fd honors `CLICOLOR_FORCE` even
+  when piped, and ANSI bytes would corrupt the index. Pass your own `--color`
+  spelling to opt out.
 - Configured ignores stay enforced no matter what you set here.
 - Flags must make `fd` print paths; positionals are builder-owned.
 
 Unset or empty falls back to the classic baseline:
 
 ```jsonc
-"fd_flags": ["--type", "file", "--type", "directory", "--absolute-path"]
+"fd_flags": ["--type", "file", "--type", "directory", "--color=never", "--absolute-path"]
 ```
 
 plus fd's own defaults: hidden entries skipped (unless `show_hidden`), VCS
@@ -190,17 +193,23 @@ Notes:
 
 - The index lives at `~/.local/state/omarchy/file-finder-list.txt`, loads at
   shell start so first searches are instant, refreshes in the background, and
-  is rewritten only when its content actually changed.
+  is rewritten only when its content actually changed. Deleting it is always
+  safe: the next shell start rebuilds it, and if it vanishes mid-session the
+  finder restores its in-memory copy on the next open so searches keep working.
 - Each rescan is one relay-wrapped `fd` walk over every live root; dead roots
-  are skipped automatically. Nested or overlapping roots collapse to the
-  outermost one, so every path indexes exactly once.
+  are skipped automatically, and the walk reports its live/total root ratio so
+  a *partially* dead scan (e.g. an unmounted HDD shrinking the index to
+  `$HOME`-only) is discarded instead of clobbering a good index — then retried
+  automatically every 10 s for up to ~4 minutes, so a boot-time mount race
+  heals itself. Nested or overlapping roots collapse to the outermost one, so
+  every path indexes exactly once.
 - `ignored_dirs` translates to cross-root `**/<suffix>` excludes; a root
   listed there drops out entirely.
 - Previews cache in memory for the whole session, keyed by path, so revisiting
   a file re-shows its preview instantly. Renders larger than 3 MB of PNG are
-  refused ("Thumbnail too large") rather than loaded. Failed previews —
-  unreadable files, over-ceiling renders, broken images — show an
-  "Unable to preview" placeholder instead of an empty or stale pane.
+  refused ("Thumbnail too large") rather than loaded. Files with nothing to
+  render — unreadable files, binary or empty files, broken images — show an
+  "Unable to preview" placeholder instead of a blank pane.
 - Successful thumbnails persist on disk under
   `~/.cache/thumbnails/shafayet.finder/{pdf,video}/`, named by
   `md5("<path>|<size>|<mtime>|<inode>")` so an edited file never gets a stale
