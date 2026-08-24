@@ -56,6 +56,40 @@ eq(M.resolveSettings({ pdf_render_scale: 100000 }, HOME).pdfRenderScale, 4000, "
 eq(M.resolveSettings({ pdf_render_scale: 1 }, HOME).pdfRenderScale, 64, "render scale clamps low")
 eq(M.resolveSettings({ pdf_render_scale: "abc" }, HOME).pdfRenderScale, M.pdfRenderScale, "garbage render scale falls back")
 
+// ================= overlapping root pruning =================
+
+eq(M.pruneContainedRoots(["/a", "/a/b", "/a/b/c"]), ["/a"], "containment chain collapses to outermost")
+eq(M.pruneContainedRoots(["/mnt/a", "/mnt/ab", "/b"]), ["/mnt/a", "/mnt/ab", "/b"],
+  "text-prefix siblings are not containment")
+eq(M.pruneContainedRoots(["/x", "/x", "/y"]), ["/x", "/y"], "exact repeats collapse to first occurrence")
+eq(M.pruneContainedRoots(["/z", "/z/y", "/q"]), ["/z", "/q"], "ordering preserved")
+eq(M.pruneContainedRoots(["/keep", "", "/keep/deep"]), ["/keep"], "empty entries dropped")
+eq(M.pruneContainedRoots([]), [], "no roots stays empty")
+
+// Nested roots in real settings resolve to the disjoint parent set.
+eq(
+  M.resolveSettings({
+    search_dirs: ["/data", "/data/Video", "/data/Documents", "/other"]
+  }, HOME).searchDirs,
+  ["/data", "/other"],
+  "nested search_dirs collapse to outermost roots"
+)
+eq(
+  M.resolveSettings({
+    search_dirs: ["$HOME", "$HOME/D"]
+  }, HOME).searchDirs,
+  [HOME],
+  "a root inside \$HOME collapses into \$HOME"
+)
+eq(
+  M.resolveSettings({
+    search_dirs: ["$HOME", "$HOME/D"],
+    ignored_dirs: ["$HOME/D"]
+  }, HOME).searchDirs,
+  [HOME],
+  "ignored nested root drops before pruning; parent still scanned"
+)
+
 // ================= expandPath =================
 
 eq(M.expandPath("$HOME", HOME), HOME, "$HOME bare")
@@ -342,6 +376,15 @@ eq(M.buildVideoThumbnailCommand("/v/clip.mp4", "/tmp/thumbbase")[2].indexOf("120
   ;[path.join(live1, "sub") + "/", path.join(live1, "a.txt"), path.join(live1, "sub", "b.txt")]
     .forEach(function (p) { ok(rows.indexOf(p) !== -1, "integration: " + p + " indexed") })
   ok(!rows.join(" ").match(/node_modules|\.cache|\/dead/), "integration: policy excludes honored, dead root absent")
+
+  // Overlapping roots (live1 contains live1/sub) must yield every path
+  // exactly once: the nested root is pruned before the walk.
+  cfg = M.resolveSettings({ search_dirs: [live1, live1 + "/sub", live2] }, HOME)
+  eq(cfg.searchDirs.indexOf(live1 + "/sub"), -1, "integration: contained root pruned from settings")
+  rows = M.markDirectories(run(M.scanCommand(cfg)))
+  ok(new Set(rows).size === rows.length, "integration: overlapping roots never duplicate rows")
+  ;[path.join(live1, "sub") + "/", path.join(live1, "sub", "b.txt")]
+    .forEach(function (p) { ok(rows.indexOf(p) !== -1, "integration: nested content still indexed once — " + p) })
 
   // truncation yields a clean prefix
   cfg = M.resolveSettings({ search_dirs: [live1, live2], max_scan_results: 3 }, HOME)

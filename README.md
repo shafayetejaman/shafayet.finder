@@ -216,9 +216,10 @@ Notes:
   dead roots are skipped automatically. Directories carry fd's trailing
   `/` marker through to the UI.
 - With multiple scanned roots, `ignored_dirs` translates to cross-root
-  `**/<suffix>` excludes (fd prunes matching subtrees under any root), and
-  nested/overlapping `search_dirs` can list a subtree more than once —
-  same as listing it in several roots by hand.
+  `**/<suffix>` excludes (fd prunes matching subtrees under any root).
+  Nested or overlapping `search_dirs` are pruned automatically to the
+  outermost containing root, so every path is indexed exactly once no
+  matter how the roots are listed.
 - Preview and PDF caches persist across open/close toggles for the whole
   shell session; revisiting a file re-shows its preview instantly. Rendered
   thumbnails (PDF pages and video frames) are kept as in-memory images

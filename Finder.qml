@@ -55,6 +55,8 @@ Item {
   readonly property int pdfCacheLimit: root.cfg.pdfCacheLimit
   property var pdfCache: ({})
   property var pdfCacheKeys: []
+  // Path whose preview the cold-start prewarm is currently fetching.
+  property string prewarmKey: ""
 
   // Shares the [menu] surface tokens — themes that style the menu also
   // style the finder, matching the clipboard overlay's approach.
@@ -110,7 +112,7 @@ Item {
     // The preview caches persist across toggles for the whole shell session,
     // so revisiting a file re-shows its preview instantly — PDF thumbnails
     // included, since their entries are self-contained data URLs.
-    root.rebuildDisplay()
+    root.rebuildDisplay(true)
     root.refreshScan()
     searchDebounce.restart()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
@@ -185,6 +187,45 @@ Item {
   // this via applyScan.
   function loadCachedList(raw) {
     root.fileListCount = FinderModel.markDirectories(String(raw || "")).length
+  }
+
+  // Cold-start warm, stage 1: pick browse row 0 out of the listing and kick
+  // its normal preview builder. In-memory only — the payload parks in
+  // previewCache so the first launch of a session paints row 0 with zero
+  // fetch; nothing is written anywhere.
+  function warmFirstRow(raw) {
+    var lines = String(raw || "").split("\n")
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i]
+      if (line.length <= 1 || line.charAt(0) !== "/") continue
+      var marked = line
+      var isDir = FinderModel.isDirPath(marked)
+      var key = isDir ? FinderModel.cleanPath(marked) : marked
+      if (!key) return
+      root.prewarmKey = key
+      warmPreviewProc.command = isDir
+        ? FinderModel.buildDirPreviewCommand(key, root.cfg.previewByteLimit, root.cfg.showHidden)
+        : FinderModel.buildPreviewCommand(marked, root.cfg.previewByteLimit)
+      warmPreviewProc.running = true
+      return
+    }
+  }
+
+  // Cold-start warm, stage 2: store the fetched listing exactly like a live
+  // dispatch would (same meta wording), so the cache entry is indistinguishable.
+  function storeWarmedPreview(raw) {
+    var key = root.prewarmKey
+    if (!key) return
+    var parsed = FinderModel.parsePreviewOutput(String(raw || ""))
+    if (parsed.size === -1) return
+    var meta
+    if (parsed.size === -2) {
+      var items = parseInt(parsed.mtime, 10)
+      meta = "Directory — " + (isNaN(items) ? "?" : items) + " items"
+    } else {
+      meta = FinderModel.formatBytes(parsed.size)
+    }
+    root.storePreviewInCache(key, meta, parsed.content)
   }
 
   function startBrowse() {
@@ -269,7 +310,11 @@ Item {
     fdProc.running = true
   }
 
-  function rebuildDisplay() {
+  // immediatePreview: launch-only fast path. open() rebuilds the display
+  // before any typing, so the first row's preview dispatches right away
+  // instead of riding the keystroke debounce; every other caller keeps the
+  // default coalescing.
+  function rebuildDisplay(immediatePreview) {
     var rows = root.searchResults ? root.searchResults : []
 
     displayModel.clear()
@@ -284,13 +329,22 @@ Item {
       })
     }
 
-    if (displayModel.count === 0) selectedIndex = 0
+    if (displayModel.count === 0) {
+      // An empty result set must not keep the last preview on screen:
+      // clear unconditionally, since selectedIndex may not actually change
+      // (it was often already 0) and its signal would then never fire.
+      selectedIndex = 0
+      root.clearPreview()
+    }
     else if (selectedIndex >= displayModel.count) selectedIndex = displayModel.count - 1
     else if (selectedIndex < 0) selectedIndex = 0
 
     // A fresh result set keeps the selection index unchanged, so the index
     // change signal alone would never preview the first row.
-    if (displayModel.count > 0) previewDebounce.restart()
+    if (displayModel.count > 0) {
+      if (immediatePreview) root.requestPreview()
+      else previewDebounce.restart()
+    }
 
     Qt.callLater(function() {
       if (displayModel.count > 0) resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
@@ -398,7 +452,10 @@ Item {
       if (line.length > 1 && line.charAt(0) === "/") rows.push(line)
     }
     root.searchResults = rows
-    root.rebuildDisplay()
+    // Browse fills (empty query) happen on open/rescan, never per keystroke,
+    // so their row-0 preview skips the keystroke debounce. Search arrivals
+    // while typing keep the default coalescing.
+    root.rebuildDisplay(root.filterText.trim() === "")
   }
 
   function killPreviewWorkers() {
@@ -600,6 +657,9 @@ Item {
   Component.onCompleted: {
     ensurePool()
     mkdirProc.running = true
+    warmRowProc.command = ["bash", "-c",
+      "( " + FinderModel.browseCommand(root.cfg)[2] + " ) 2>/dev/null | head -n 4"]
+    warmRowProc.running = true
   }
 
   ListModel { id: displayModel }
@@ -624,6 +684,25 @@ Item {
     id: mkdirProc
     command: ["bash", "-c", "mkdir -p \"$HOME/.local/state/omarchy\""]
     onExited: root.refreshScan()
+  }
+
+  // Cold-start prewarm chain: runs ONCE at shell start, then never again —
+  // no timers, no idle cost. Stage 1 resolves browse row 0; stage 2 runs its
+  // ordinary preview command and parks the payload in previewCache.
+  Process {
+    id: warmRowProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.warmFirstRow(text)
+    }
+  }
+
+  Process {
+    id: warmPreviewProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.storeWarmedPreview(text)
+    }
   }
 
   Process {

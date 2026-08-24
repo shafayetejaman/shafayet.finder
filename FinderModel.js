@@ -130,7 +130,10 @@ function resolveSettings(settings, home) {
     if (ignoredDirs.indexOf(dirs[i]) === -1) effectiveDirs.push(dirs[i])
   }
   return {
-    searchDirs: effectiveDirs,
+    // Nested/overlapping roots are pruned so the combined walk never emits
+    // a path twice; every downstream consumer (scans, flag-mode walks,
+    // exclude computation) sees this disjoint set.
+    searchDirs: pruneContainedRoots(effectiveDirs),
     // Names prune as unanchored excludes (any depth); dirs as anchored
     // per-root excludes (see fdExcludeArgs).
     ignoreNames: builtinIgnoreNames.concat(ignoredNames(settings)),
@@ -217,6 +220,33 @@ function combinedExcludeArgs(ignoreNames, ignoredDirs, searchDirs) {
     args.push("--exclude", "**/" + rel)
   }
   return args
+}
+
+// Overlapping search roots make one combined fd walk emit the same path
+// once per enclosing root (a nested root's entries are fully covered by its
+// parent anyway). Collapse exact repeats to their first occurrence, then
+// drop any root strictly contained by a surviving one — order preserved,
+// sibling names that merely share a text prefix ("/mnt/a", "/mnt/ab")
+// untouched. The result is a disjoint root set, so every path is indexed
+// exactly once no matter how the user lists their roots.
+function pruneContainedRoots(dirs) {
+  var unique = []
+  var seen = {}
+  for (var i = 0; i < dirs.length; i++) {
+    var dir = String(dirs[i] || "")
+    if (!dir || seen[dir]) continue
+    seen[dir] = true
+    unique.push(dir)
+  }
+  var pruned = []
+  for (i = 0; i < unique.length; i++) {
+    var covered = false
+    for (var j = 0; j < unique.length && !covered; j++) {
+      if (unique[j] !== unique[i] && unique[i].indexOf(unique[j] + "/") === 0) covered = true
+    }
+    if (!covered) pruned.push(unique[i])
+  }
+  return pruned
 }
 
 // Longest "dir sits below this root" suffix, or "" when no scanned root
@@ -837,6 +867,7 @@ if (typeof module !== "undefined") {
     asStringArray: asStringArray,
     expandPaths: expandPaths,
     searchDirs: searchDirs,
+    pruneContainedRoots: pruneContainedRoots,
     shellQuote: shellQuote,
     fdDebounceMs: fdDebounceMs,
     FD_VALUE_FLAGS: FD_VALUE_FLAGS,
