@@ -12,6 +12,9 @@ var debounceMs = 40
 var fdDebounceMs = 1000
 var rescanIntervalMs = 60000
 var pdfRenderScale = 1200
+// Hard cap for one pdftoppm/ffmpeg render; a hung producer must surface as an
+// honest -1 failure instead of an eternal blank pane.
+var renderTimeoutSecs = 45
 // Persistent thumbnails under ~/.cache/thumbnails/<plugin>/{pdf,video}/,
 // keyed by md5("<path>|<size>|<mtime>|<inode>"). <= 0 disables persistence.
 var thumbnailCacheLimit = 500
@@ -806,13 +809,26 @@ function isVideoPath(path) {
   return /\.(mp4|mkv|webm|mov|avi|m4v|mpg|mpeg|wmv|flv|m2ts|ts|3gp|ogv)$/i.test(String(path || ""))
 }
 
+// Last 12 bytes of every complete PNG: IEND's length prefix, type and CRC.
+// Header-only checks ([ -s ], file(1)) accept truncated files, which older
+// plugin versions could publish — serving one yields a silent blank pane.
+var pngEndMarker = "0000000049454e44ae426082"
+
+// Shell condition: true when the file's tail carries the PNG IEND trailer.
+function pngCompleteTest(fileExpr) {
+  return '[ "$(tail -c 12 -- ' + fileExpr
+    + ' 2>/dev/null | od -An -tx1 | tr -d \' \\n\')" = "' + pngEndMarker + '" ]'
+}
+
 // Shared body for both thumbnail producers (PDF/video differ only in the
 // render snippet). Disk protocol: key = md5("<path>|<size>|<mtime>|<inode>")
 // so an edited or replaced source can never produce a false hit. Hit streams
-// the stored PNG and exits before any renderer or scratch dir runs. Miss
-// renders privately and publishes atomically (.part unlinked then renamed)
-// only when within the byte ceiling; oversized (-3) and failed (-1) results
-// are never saved. After a save the store is pruned to the newest
+// the stored PNG and exits before any renderer or scratch dir runs; a stored
+// file failing the IEND check is deleted and falls through to a fresh render,
+// healing poison left by earlier versions. Miss renders privately and
+// publishes atomically (.part unlinked then renamed) only when within the
+// byte ceiling AND itself IEND-complete; oversized (-3), truncated and failed
+// (-1) results are never saved. After a save the store is pruned to the newest
 // <cacheLimit> files. An unavailable store degrades to render-without-persist.
 // Empty storeDir or limit <= 0 disables the disk layer entirely.
 function thumbnailShellBody(path, outBase, storeDir, cacheLimit, renderSnippet, ceiling) {
@@ -825,7 +841,7 @@ function thumbnailShellBody(path, outBase, storeDir, cacheLimit, renderSnippet, 
     + " sz=$(stat -Lc %s -- " + quoted + " 2>/dev/null);"
   var mid = " tmp=\"$tmpd/page.png\";"
     + " " + renderSnippet
-    + " if [ -s \"$tmp\" ]; then"
+    + " if [ -s \"$tmp\" ] && " + pngCompleteTest('"$tmp"') + "; then"
     + " if [ \"$(stat -Lc %s -- \"$tmp\")\" -le " + ceiling + " ]; then"
   var close = ' printf "\\t%s\\t\\n" "${sz:-?}";'
     + " base64 -w0 \"$tmp\";"
@@ -853,8 +869,10 @@ function thumbnailShellBody(path, outBase, storeDir, cacheLimit, renderSnippet, 
     + " thumb=\"\";"
     + " { [ -d \"$store\" ] || mkdir -p -- \"$store\"; } 2>/dev/null && thumb=\"$store/$key.png\";"
     + " if [ -n \"$thumb\" ] && [ -s \"$thumb\" ]; then"
+    + " if " + pngCompleteTest('"$thumb"') + "; then"
     + ' printf "\\t%s\\t\\n" "${sz:-?}";'
     + " base64 -w0 -- \"$thumb\"; exit 0; fi;"
+    + " rm -f -- \"$thumb\"; fi;"
     + " " + scratchPre
     + " tmpd=$(mktemp -d -- " + quotedBase + ".XXXXXX) || { printf '\\t-1\\t\\n'; exit 0; };"
     + mid
@@ -873,7 +891,8 @@ function thumbnailShellBody(path, outBase, storeDir, cacheLimit, renderSnippet, 
 function buildPdfPreviewCommand(path, outBase, storeDir, cacheLimit, scale, ceiling) {
   if (scale === undefined) scale = pdfRenderScale
   if (!isFinite(ceiling) || ceiling <= 0) ceiling = thumbPngByteCeiling
-  var render = termRelay("pdftoppm -png -f 1 -singlefile -scale-to " + scale
+  var render = termRelay("timeout -k 5 " + renderTimeoutSecs
+    + " pdftoppm -png -f 1 -singlefile -scale-to " + scale
     + " " + shellQuote(path) + " \"${tmp%.png}\"") + ";"
   return ["bash", "-c", thumbnailShellBody(path, outBase, storeDir, cacheLimit, render, ceiling)]
 }
@@ -893,7 +912,8 @@ function buildVideoThumbnailCommand(path, outBase, storeDir, cacheLimit, scale, 
   if (scale === undefined) scale = pdfRenderScale
   if (!isFinite(ceiling) || ceiling <= 0) ceiling = thumbPngByteCeiling
   var grab = function (ss) {
-    return termRelay("ffmpeg -nostdin -hide_banner -loglevel error -ss " + ss
+    return termRelay("timeout -k 5 " + renderTimeoutSecs
+      + " ffmpeg -nostdin -hide_banner -loglevel error -ss " + ss
       + " -i " + shellQuote(path)
       + " -frames:v 1 -map v:0 -vf 'scale=min(iw\\," + scale + "):-2'"
       + " -y \"$tmp\"") + ";"
@@ -988,6 +1008,9 @@ if (typeof module !== "undefined") {
     buildVideoThumbnailCommand: buildVideoThumbnailCommand,
     thumbPngByteCeiling: thumbPngByteCeiling,
     pdfDataUrl: pdfDataUrl,
+    renderTimeoutSecs: renderTimeoutSecs,
+    pngEndMarker: pngEndMarker,
+    pngCompleteTest: pngCompleteTest,
     formatBytes: formatBytes
   }
 }

@@ -331,8 +331,12 @@ ok(pcs[2].indexOf("if [ -n \"$thumb\" ]; then") !== -1,
   "save and GC skipped entirely when the store is unavailable")
 ok(pcs[2].indexOf("mkdir -p -- '/tmp' 2>/dev/null; tmpd=$(mktemp -d -- '/tmp/base'.XXXXXX)") !== -1,
   "persisting job guarantees its own scratch base directory")
-ok(pcs[2].indexOf('base64 -w0 -- "$thumb"; exit 0; fi; mkdir -p') !== -1,
+ok(pcs[2].indexOf('rm -f -- "$thumb"; fi; mkdir -p') !== -1,
   "cache hits skip the scratch entirely")
+ok(pcs[2].indexOf('if [ -n "$thumb" ] && [ -s "$thumb" ]; then if ' + M.pngCompleteTest('"$thumb"') + "; then") !== -1,
+  "stored hits are served only when IEND-complete, else deleted for re-render")
+ok(pc[2].indexOf('if [ -s "$tmp" ] && ' + M.pngCompleteTest('"$tmp"') + "; then") !== -1,
+  "a render must be IEND-complete before any publish or stream")
 
 // ================= misc regressions =================
 
@@ -688,6 +692,41 @@ ok(vt.indexOf("grep -v '\\.part$'") !== -1,
   eq(fs.readdirSync(store).length, 1, "integration: successful render saved exactly one stored png")
   var savedKey = fs.readdirSync(store)[0]
   ok(/^[0-9a-f]{32}\.png$/.test(savedKey), "integration: stored name is an md5 key")
+  ok(cmd[2].indexOf("timeout -k 5 " + M.renderTimeoutSecs + " pdftoppm") !== -1,
+    "integration: pdf render is wrapped in a hard timeout")
+
+  // PNG integrity gate: only IEND-terminated files count as complete.
+  var goodPng = fs.readFileSync(path.join(store, savedKey))
+  function tailVerdict(buf, name) {
+    var f = path.join(tmp, name)
+    fs.writeFileSync(f, buf)
+    return cp.execFileSync("bash",
+      ["-c", M.pngCompleteTest(M.shellQuote(f)) + " && echo yes || echo no"],
+      { encoding: "utf8" }).trim()
+  }
+  eq(tailVerdict(goodPng, "good.png"), "yes",
+    "integration: IEND-terminated png passes the completeness check")
+  eq(tailVerdict(goodPng.slice(0, goodPng.length - 6), "cut.png"), "no",
+    "integration: truncated png fails the completeness check")
+  eq(tailVerdict(Buffer.from("tooshort"), "junk.png"), "no",
+    "integration: sub-trailer junk fails the completeness check")
+
+  // Poisoned store entry (a truncated PNG as old plugin versions could
+  // leave): the hit path must reject it, delete it, and serve a fresh
+  // valid render instead.
+  var healStore = path.join(tmp, "heal-store", "pdf")
+  var healCmd = M.buildPdfPreviewCommand(pdf, path.join(tmp, "render"), healStore, 500, 200)
+  out = cp.execFileSync(healCmd[0], [healCmd[1], healCmd[2]], { encoding: "utf8" })
+  ok(M.parsePreviewOutput(out).size > 0, "integration: clean render populates the heal store")
+  var healKey = fs.readdirSync(healStore)[0]
+  fs.truncateSync(path.join(healStore, healKey), 1000)
+  out = cp.execFileSync(healCmd[0], [healCmd[1], healCmd[2]], { encoding: "utf8" })
+  parsed = M.parsePreviewOutput(out)
+  ok(parsed.size > 0, "integration: poisoned store entry is never served")
+  eq(fs.readFileSync(path.join(healStore, healKey)).slice(-12).toString("hex"), M.pngEndMarker,
+    "integration: poisoned entry replaced by an IEND-complete render")
+  eq(fs.readdirSync(healStore).length, 1,
+    "integration: healing keeps exactly one stored png")
 
   // Cache hit: with the ceiling absurdly low a fresh render would report -3;
   // only the disk fast path can still report a real payload.
@@ -773,6 +812,8 @@ ok(vt.indexOf("grep -v '\\.part$'") !== -1,
     "integration: video scratch dir removed")
   eq(fs.readdirSync(store).length, 1, "integration: extracted frame saved to the disk store")
   var savedSize = parsed.size
+  ok(cmd[2].indexOf("timeout -k 5 " + M.renderTimeoutSecs + " ffmpeg") !== -1,
+    "integration: ffmpeg extraction is wrapped in a hard timeout")
 
   // Disk hit: low ceiling would force -3 on a fresh extraction; only the
   // store fast path can still return pixels.

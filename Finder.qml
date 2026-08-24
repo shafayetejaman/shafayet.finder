@@ -1414,7 +1414,12 @@ font.pixelSize: root.cfg.contentCaption
                 asynchronous: true
                 smooth: true
                 onStatusChanged: {
-                  if (status === Image.Error) root.previewUnavailable = true
+                  if (root.previewSource === "") return
+                  // Any undecodable image must surface the placeholder. Error
+                  // alone is not enough: a Null status (data URL Qt refuses
+                  // without entering Error) would otherwise leave a silent
+                  // blank pane.
+                  if (status === Image.Error || status === Image.Null) root.previewUnavailable = true
                 }
               }
 
