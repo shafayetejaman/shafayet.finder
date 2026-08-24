@@ -174,6 +174,30 @@ s = M.scanCommand(over, "/state/dir")[2]
 ok(s.indexOf("mkdir -p -- '/state/dir'; ") === 0 && s.indexOf("fd ") !== -1,
   "override scan creates state dir first")
 
+// The short spelling satisfies the forced absolute-path requirement too:
+// a relative-output override walk would index nothing.
+eq(M.fdOverrideArgs(["-a"]), ["-a"], "-a counts as --absolute-path")
+eq(M.fdOverrideArgs(["-a", "-E", "x"]), ["-a", "-E", "x"], "-a kept among other flags verbatim")
+eq(M.fdOverrideArgs(["--ignore-vcs"]), ["--ignore-vcs", "--absolute-path"], "long form still appended when absent")
+var overA = M.resolveSettings({ search_dirs: ["/r1"], fd_flags: ["-a"] }, HOME)
+s = M.scanCommand(overA)[2]
+ok(s.indexOf("'-a'") !== -1 && s.indexOf("absolute-path") === -1,
+  "override scan with -a neither duplicates nor appends the long form")
+
+// ================= fd_flags exec-flag rejection =================
+
+var poisoned = M.resolveSettings({ search_dirs: ["/r1"], fd_flags: ["--ignore-vcs", "-x", "rm", "-rf", "/"] }, HOME)
+ok(poisoned.fdOverrideArgs === null, "exec flag in fd_flags rejects the whole override")
+eq(poisoned.fdFlags, [], "poisoned fd_flags falls back to the classic baseline")
+ok(M.scanCommand(poisoned)[2].indexOf("rm") === -1 && M.browseCommand(poisoned)[2].indexOf("rm") === -1,
+  "rejected exec payload never reaches any generated command")
+ok(M.resolveSettings({ search_dirs: ["/r1"], fd_flags: ["--exec=sh", "ls"] }, HOME).fdOverrideArgs === null,
+  "attached exec spelling rejected too")
+ok(M.resolveSettings({ search_dirs: ["/r1"], fd_flags: ["-X"] }, HOME).fdOverrideArgs === null,
+  "short batch spelling rejected too")
+ok(M.hasExecFlag(["--ignore-vcs", "--exec-batch", "x"]), "batch spelling detected")
+ok(!M.hasExecFlag(["--ignore-vcs", "--hidden"]), "clean flags pass through")
+
 // ================= browse =================
 
 var bc = M.resolveSettings({ browse_dir: "/tmp/browsethis" }, HOME)
@@ -290,6 +314,8 @@ ok(pcs[2].indexOf('base64 -w0 -- "$thumb"; exit 0') !== -1,
 ok(pcs[2].indexOf("\"$thumb.part\" && mv -f -- \"$thumb.part\" \"$thumb\"") !== -1,
   "save publishes atomically via same-directory rename")
 ok(pcs[2].indexOf("tail -n +501") !== -1, "GC prunes beyond the configured cap")
+ok(pcs[2].indexOf("grep -v '\\.part$'") !== -1,
+  "GC never counts or deletes in-flight .part temporaries")
 ok(pcs[2].indexOf("-le " + M.thumbPngByteCeiling) !== -1, "ceiling still enforced when persisting")
 ok(pcs[2].indexOf("if [ -n \"$thumb\" ]; then") !== -1,
   "save and GC skipped entirely when the store is unavailable")
@@ -495,6 +521,8 @@ ok(vt.indexOf('rm -rf -- "$tmpd"') !== -1, "private scratch dir always cleaned")
 eq(M.buildVideoThumbnailCommand("/v/clip.mp4", "/tmp/thumbbase", "", 0)[2].indexOf("1200") !== -1,
   true, "render scale defaults (persistence disabled)")
 ok(vt.indexOf("tail -n +301") !== -1, "video store prunes at its own cap")
+ok(vt.indexOf("grep -v '\\.part$'") !== -1,
+  "video GC ignores in-flight .part temporaries too")
 
 // ================= integration: real execution =================
 // Executes generated scripts against a throwaway tree to prove the bash
@@ -758,6 +786,79 @@ ok(vt.indexOf("tail -n +301") !== -1, "video store prunes at its own cap")
   }
 
   fs.rmSync(tmp, { recursive: true, force: true })
+})()
+
+// ================= shell-injection regression =================
+// Hostile strings must travel as inert data inside single quotes. Every
+// builder below is executed for real with cwd=base; a sentinel file appears
+// only if quoting broke and bash executed the payload. Payloads lean on
+// $(command substitution) rather than quote-breakouts: dropped quotes make
+// breakout strings re-quote themselves harmlessly, while $() only survives
+// when the builder's own escaping is intact.
+
+;(function injectionSuite() {
+  var base = fs.mkdtempSync(path.join(os.tmpdir(), "finder-inj-"))
+  function sentinel(n) { return path.join(base, n) }
+  function run(cmd) {
+    var out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8", cwd: base })
+    return out
+  }
+  function assertInert(name) {
+    ok(!fs.existsSync(sentinel(name)), "injection: $" + "() payload stayed inert (" + name + ")")
+  }
+
+  // Classic breakout attempt still exercises the escaping itself.
+  var breakout = "' ; touch PWNEDQ ; '"
+  eq(M.shellQuote(breakout), "''\\'' ; touch PWNEDQ ; '\\'''", "shellQuote escapes the breakout quote")
+
+  // Preview of a hostile-named FILE: must stay inert AND keep working.
+  var evilFile = path.join(base, "$(touch PWNP).txt")
+  fs.writeFileSync(evilFile, "hello")
+  var parsed = M.parsePreviewOutput(run(M.buildPreviewCommand(evilFile, 1024)))
+  eq(parsed.size, 5, "injection: hostile filename still previews correctly")
+  eq(parsed.content, "hello", "injection: hostile filename content intact")
+  assertInert("PWNP")
+
+  // Directory preview of a hostile-named DIR.
+  var evilDir = path.join(base, "$(touch PWND).d")
+  fs.mkdirSync(evilDir)
+  fs.writeFileSync(path.join(evilDir, "inner.txt"), "x")
+  parsed = M.parsePreviewOutput(run(M.buildDirPreviewCommand(evilDir, 1024, false)))
+  eq(parsed.size, -2, "injection: hostile dir name reports -2")
+  eq(parseInt(parsed.mtime, 10), 1, "injection: hostile dir item count correct")
+  ok(parsed.content.indexOf("inner.txt") !== -1, "injection: hostile dir listing intact")
+  assertInert("PWND")
+
+  // fzf stage with a hostile query.
+  var listPath = path.join(base, "list.txt")
+  fs.writeFileSync(listPath, [evilFile, evilDir + "/"].join("\n"))
+  run(M.buildSearchCommand(listPath, "$(touch PWNF)", 25))
+  assertInert("PWNF")
+
+  // Live fd walk whose pattern token smuggles a spaceless substitution
+  // ($IFS expands to a space): unquoted it would execute inside argStr.
+  var cfg = M.resolveSettings({ search_dirs: [base] }, "/home/tester")
+  run(M.liveFdCommand(cfg, parse("a$(touch$IFSPWNL)b"), 50))
+  assertInert("PWNL")
+
+  // Classic scan with hostile ignore names feeding the exclude segment.
+  var tree = path.join(base, "tree")
+  fs.mkdirSync(tree)
+  fs.writeFileSync(path.join(tree, "f.txt"), "f")
+  var scanCfg = M.resolveSettings(
+    { search_dirs: [tree], ignored_names: ["z$(touch PWNS)z"], ignored_dirs: ["$HOME/y$(touch PWNG)y"] },
+    "/home/tester")
+  run(M.scanCommand(scanCfg))
+  assertInert("PWNS")
+  assertInert("PWNG")
+
+  // Thumbnail producers on a hostile nonexistent path (fast -1 path).
+  run(M.buildPdfPreviewCommand(path.join(base, "$(touch PWNY).pdf"), path.join(base, "r"), "", 0, 64))
+  run(M.buildVideoThumbnailCommand(path.join(base, "$(touch PWNV).mp4"), path.join(base, "r"), "", 0, 64))
+  assertInert("PWNY")
+  assertInert("PWNV")
+
+  fs.rmSync(base, { recursive: true, force: true })
 })()
 
 console.log("OK — " + passed + " assertions passed")

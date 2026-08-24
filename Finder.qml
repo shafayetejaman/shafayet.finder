@@ -45,10 +45,17 @@ Item {
   // Paths deleted this session; filtered out of every result producer so a
   // trashed file never resurfaces before the next index rescan.
   property var trashedPaths: ({})
+  // One-shot startup probe; Delete-to-trash degrades to an honest hint when
+  // trash-cli is absent instead of silently pretending the row was trashed.
+  property bool trashAvailable: false
   property bool previewIsImage: false
   property string previewSource: ""
   property string previewMeta: ""
   property string previewContent: ""
+  // True while the selected row's preview is known-broken (unreadable file,
+  // over-ceiling render, undecodable image): the pane shows the placeholder
+  // instead of stale pixels. Reset whenever a fresh preview is requested.
+  property bool previewUnavailable: false
 
   // path -> { meta, content }; oldest-first keys for LRU eviction.
   readonly property int previewCacheLimit: root.cfg.previewCacheLimit
@@ -56,8 +63,9 @@ Item {
   property var previewCacheKeys: []
   // mktemp template for per-job private scratch dirs; nothing here persists.
   readonly property string pdfPngBase: home + "/.local/state/omarchy/file-finder-pdf"
-  // Persistent thumbnail store, keyed md5("<path>|<size>|<mtime>") so an
-  // edited source can never hit stale. Plugin subdir avoids freedesktop-spec
+  // Persistent thumbnail store, split per kind into <base>/{pdf,video} and
+  // keyed md5("<path>|<size>|<mtime>|<inode>") so an edited source can never
+  // hit stale. Plugin subdir avoids freedesktop-spec
   // directories other apps own and garbage-collect.
   readonly property string thumbStoreBase: (Quickshell.env("XDG_CACHE_HOME") || home + "/.cache") + "/thumbnails/" + pluginId
   // Self-contained data URLs so entries never go stale under us; the first
@@ -103,6 +111,8 @@ Item {
   }
 
   readonly property var cfg: FinderModel.resolveSettings(pluginSettings, home)
+
+  onCfgChanged: root.ensurePool()
 
   function open(payloadJson) {
     root.opened = true
@@ -163,6 +173,13 @@ Item {
 
   function applyScan(raw) {
     var text = String(raw || "")
+    // An all-dead scan (every root unmounted or gone) must never clobber the
+    // good on-disk index: keep serving it until a real walk succeeds again.
+    if (!text && root.lastIndexFromDisk && root.lastIndexedText) {
+      root.lastScanFinishedAt = Date.now()
+      root.scanning = false
+      return
+    }
     root.fileListCount = FinderModel.countPaths(text)
     root.lastScanFinishedAt = Date.now()
     root.scanning = false
@@ -209,6 +226,9 @@ Item {
     if (!key) return
     var parsed = FinderModel.parsePreviewOutput(String(raw || ""))
     if (parsed.size === -1) return
+    // Oversize renders stay uncached so selecting the file later reports
+    // "Thumbnail too large" instead of serving an empty warmed entry.
+    if (parsed.size === -3) return
     var meta
     if (parsed.size === -2) {
       var items = parseInt(parsed.mtime, 10)
@@ -247,6 +267,15 @@ Item {
         root.rebuildDisplay()
         return
       }
+      // Same completed walk (e.g. a background rescan landed mid-query):
+      // refilter the baseline instantly instead of killing and re-walking.
+      var key = FinderModel.fdCacheKey(root.cfg, parsed)
+      if (key !== "" && key === root.lastFdKey) {
+        refreshFlagDisplay()
+        return
+      }
+      // Identical walk already queued or in flight: let it finish.
+      if (fdProc.pendingKey === key && (fdProc.running || fdProc.queuedStart)) return
       root.searchSerial++
       root.fdSerial++
       fdProc.revision = root.fdSerial
@@ -356,23 +385,24 @@ Item {
 
   // Warm path: same-key edits land here with zero latency, never clearing
   // rows. Typing extensions rescore only the previous match set; anything
-  // else (first pass, backspace, edits) rescans the baseline under the cap.
+  // else rescans the baseline. Both share the generous cap so a finished
+  // pass stays marked complete even when many rows match — a display-sized
+  // cap would flip complete to false on nearly every step and force the
+  // next keystroke back onto the full baseline.
   function refreshFlagDisplay() {
     var staged = fdStagedText()
     var cache = root.fdWarmCache
     var candidates = FinderModel.warmCandidates(cache ? cache.matches : null,
       cache ? cache.staged : "", staged, cache ? cache.complete : false)
-    var fullPass = !candidates
     if (!candidates) candidates = root.fdBaseRows
-    var limit = fullPass ? root.fdWarmCacheCap : root.cfg.maxDisplayRows
-    var rows = FinderModel.fuzzyFilterRows(candidates, staged, limit)
+    var rows = FinderModel.fuzzyFilterRows(candidates, staged, root.fdWarmCacheCap)
     // Uncapped-at-limit matches feed the next narrow keystroke; trashed rows
     // stay a display-only concern so the memo keeps describing the walk.
     var visible = []
     for (var i = 0; i < rows.length; i++) {
       if (!root.trashedPaths[rows[i]]) visible.push(rows[i])
     }
-    root.fdWarmCache = { staged: staged, matches: rows, complete: rows.length < limit }
+    root.fdWarmCache = { staged: staged, matches: rows, complete: rows.length < root.fdWarmCacheCap }
     root.searchResults = visible.slice(0, root.cfg.maxDisplayRows)
     root.rebuildDisplay()
   }
@@ -419,8 +449,10 @@ Item {
     else searchProc.queuedStart = false
     root.browseSerial++
     browseProc.revision = root.browseSerial
+    // Stop unconditionally: an armed retry timer must not fire after the kill
+    // and overwrite a live query's results with a stale browse listing.
+    browseDebounce.stop()
     if (browseProc.running) browseProc.running = false
-    else browseDebounce.stop()
     root.fdSerial++
     fdProc.revision = root.fdSerial
     if (fdProc.running) fdProc.running = false
@@ -495,6 +527,15 @@ Item {
   function trashIndex(index) {
     var row = activeRow(index)
     if (!row) return
+    if (!root.trashAvailable) {
+      // Keep the row and selection intact; the hint clears on the next
+      // selection change, when requestPreview/showCachedPreview reset meta.
+      root.previewIsImage = false
+      root.previewUnavailable = true
+      root.previewMeta = "Cannot trash: trash-cli is not installed"
+      root.previewContent = ""
+      return
+    }
     Util.execDetached("trash-put " + Util.shellQuote(FinderModel.cleanPath(row.path)))
     root.trashedPaths[row.path] = true
     // Stay open: drop the trashed row and let the selection fall on the next
@@ -566,6 +607,7 @@ Item {
     root.previewSource = ""
     root.previewMeta = ""
     root.previewContent = ""
+    root.previewUnavailable = false
   }
 
   function requestPreview() {
@@ -574,6 +616,8 @@ Item {
       root.clearPreview()
       return
     }
+    // Fresh attempt: the placeholder only comes back if this preview fails.
+    root.previewUnavailable = false
 
     var marked = row.path
 
@@ -588,7 +632,7 @@ Item {
         root.prefetchNeighbors()
         return
       }
-      root.dispatchPreview("video", cleanVideo, marked, FinderModel.buildVideoThumbnailCommand(cleanVideo, root.pdfPngBase, root.thumbStoreBase, root.cfg.thumbnailCacheLimit, root.cfg.pdfRenderScale))
+      root.dispatchPreview("video", cleanVideo, marked, FinderModel.buildVideoThumbnailCommand(cleanVideo, root.pdfPngBase, root.thumbStoreBase + "/video", root.cfg.thumbnailCacheLimit, root.cfg.pdfRenderScale))
       return
     }
 
@@ -624,9 +668,10 @@ Item {
         root.previewSource = pdfHit.url
         root.previewMeta = ""
         root.previewContent = ""
+        root.prefetchNeighbors()
         return
       }
-      root.dispatchPreview("pdf", cleanPdf, marked, FinderModel.buildPdfPreviewCommand(cleanPdf, root.pdfPngBase, root.thumbStoreBase, root.cfg.thumbnailCacheLimit, root.cfg.pdfRenderScale))
+      root.dispatchPreview("pdf", cleanPdf, marked, FinderModel.buildPdfPreviewCommand(cleanPdf, root.pdfPngBase, root.thumbStoreBase + "/pdf", root.cfg.thumbnailCacheLimit, root.cfg.pdfRenderScale))
       return
     }
 
@@ -645,6 +690,7 @@ Item {
     ensurePool()
     // Scan folds its state-dir mkdir, so no dedicated startup process is needed.
     root.refreshScan()
+    trashProbeProc.running = true
     warmRowProc.command = ["bash", "-c",
       "( " + FinderModel.browseCommand(root.cfg)[2] + " ) 2>/dev/null | head -n 4"]
     warmRowProc.running = true
@@ -672,6 +718,12 @@ Item {
       root.lastIndexFromDisk = false
       root.loadCachedList("")
     }
+  }
+
+  Process {
+    id: trashProbeProc
+    command: ["bash", "-c", "command -v trash-put >/dev/null 2>&1"]
+    onExited: root.trashAvailable = exitCode === 0
   }
 
   Process {
@@ -810,9 +862,16 @@ Item {
   property var previewPool: []
 
   function ensurePool() {
-    if (previewPool.length > 0) return
     var size = Math.max(1, root.cfg.previewWorkers)
-    for (var i = 0; i < size; i++) {
+    // Shrink only idle workers; busy ones linger until a later call retires
+    // them, so a hot-reloaded preview_workers never kills in-flight renders.
+    for (var i = previewPool.length - 1; i >= size; i--) {
+      var surplus = previewPool[i]
+      if (surplus.running || surplus.queuedStart || surplus.cooldown) continue
+      previewPool.splice(i, 1)
+      surplus.destroy()
+    }
+    while (previewPool.length < size) {
       previewPool.push(previewWorkerComp.createObject(root))
     }
   }
@@ -880,6 +939,7 @@ Item {
       if (parsed.size === -1) {
         if (isSelected) {
           root.previewIsImage = false
+          root.previewUnavailable = true
           root.previewMeta = "Unreadable file"
           root.previewContent = ""
         }
@@ -890,6 +950,7 @@ Item {
       if (parsed.size === -3 || url === "") {
         if (isSelected) {
           root.previewIsImage = false
+          root.previewUnavailable = true
           root.previewMeta = "Thumbnail too large"
           root.previewContent = ""
         }
@@ -918,6 +979,7 @@ Item {
     if (parsed.size === -1) {
       // Uncached so a reappearance gets a fresh attempt.
       if (isSelected) {
+        root.previewUnavailable = true
         root.previewMeta = "Unreadable file"
         root.previewContent = ""
       }
@@ -949,6 +1011,7 @@ Item {
     }
     var row = activeRow(root.selectedIndex)
     if (!row) return false
+    root.previewUnavailable = false
     var marked = row.path
 
     if (FinderModel.isVideoPath(marked)) {
@@ -984,6 +1047,7 @@ Item {
         root.previewSource = pdfHit.url
         root.previewMeta = ""
         root.previewContent = ""
+        root.prefetchNeighbors()
         return true
       }
       return false
@@ -1260,7 +1324,8 @@ font.pixelSize: root.cfg.contentCaption
               }
 
               Image {
-                visible: root.previewIsImage
+                id: previewImage
+                visible: root.previewIsImage && status !== Image.Error
                 anchors.fill: parent
                 anchors.leftMargin: root.contentMargin
                 anchors.topMargin: 0
@@ -1269,6 +1334,35 @@ font.pixelSize: root.cfg.contentCaption
                 verticalAlignment: Image.AlignTop
                 asynchronous: true
                 smooth: true
+                onStatusChanged: {
+                  if (status === Image.Error) root.previewUnavailable = true
+                }
+              }
+
+              Column {
+                anchors.centerIn: parent
+                spacing: Style.space(8)
+                visible: root.previewUnavailable
+
+                Text {
+                  text: "󰷑"
+                  color: root.selectedText
+                  opacity: 0.8
+                  font.family: root.fontFamily
+                  font.pixelSize: root.cfg.contentDisplayLarge
+                  horizontalAlignment: Text.AlignHCenter
+                  width: parent.width
+                }
+
+                Text {
+                  text: "Unable to preview"
+                  color: root.foreground
+                  opacity: 0.7
+                  font.family: root.fontFamily
+                  font.pixelSize: root.contentFontSize
+                  horizontalAlignment: Text.AlignHCenter
+                  width: parent.width
+                }
               }
             }
           }

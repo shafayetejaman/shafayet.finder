@@ -13,7 +13,7 @@ var fdDebounceMs = 1000
 var rescanIntervalMs = 60000
 var pdfRenderScale = 1200
 // Persistent thumbnails under ~/.cache/thumbnails/<plugin>/{pdf,video}/,
-// keyed by md5("<path>|<size>|<mtime>"). <= 0 disables persistence.
+// keyed by md5("<path>|<size>|<mtime>|<inode>"). <= 0 disables persistence.
 var thumbnailCacheLimit = 500
 // Producers refuse PNGs above this; bounds the stdout collector and the
 // resident memory of cached data URLs (base64 inflates bytes ~4/3).
@@ -62,6 +62,24 @@ function sanitizedFdFlags(flags) {
   return out
 }
 
+// Any execution flag disqualifies a static override entirely: -x/--exec and
+// friends consume variable argument lists (up to ";"), so reliably excising
+// them is riskier than discarding the override. The search box already
+// demotes typed exec flags; config gets the same outcome by falling back to
+// the classic baseline.
+function hasExecFlag(flags) {
+  var source = Array.isArray(flags) ? flags : []
+  for (var i = 0; i < source.length; i++) {
+    var flag = String(source[i] || "")
+    if (!flag) continue
+    var bare = flag
+    var eq = flag.indexOf("=")
+    if (eq !== -1) bare = flag.substring(0, eq)
+    if (FD_EXEC_FLAGS.hasOwnProperty(bare)) return true
+  }
+  return false
+}
+
 function fdFlagSegment(flags) {
   var clean = sanitizedFdFlags(flags)
   var parts = []
@@ -75,12 +93,13 @@ function shellJoin(args) {
   return parts
 }
 
-// Override-mode flags verbatim, plus forced --absolute-path: the index
-// stores absolute paths, so relative output would be unusable.
+// Override-mode flags verbatim, plus forced --absolute-path when neither
+// spelling is present: the index stores absolute paths, so relative output
+// would be unusable.
 function fdOverrideArgs(flags) {
   var args = Array.isArray(flags) ? flags.slice() : []
   for (var i = 0; i < args.length; i++) {
-    if (args[i] === "--absolute-path") return args
+    if (args[i] === "--absolute-path" || args[i] === "-a") return args
   }
   args.push("--absolute-path")
   return args
@@ -108,6 +127,9 @@ function resolveBrowseDir(settings, home) {
 // with {} or null.
 function resolveSettings(settings, home) {
   var rawFd = asStringArray(setting(settings, "fd_flags", []))
+  // One gate for both consumers: a poisoned fd_flags must not reach the
+  // classic flag segment any more than the override path.
+  var safeFd = hasExecFlag(rawFd) ? [] : rawFd
   var ignoredDirs = expandPaths(asStringArray(setting(settings, "ignored_dirs", [])), home)
   var dirs = searchDirs(settings, home)
   // A root listed in ignored_dirs opts its whole subtree out.
@@ -139,8 +161,8 @@ function resolveSettings(settings, home) {
     contentCaption: positiveInt(settings, "content_caption", fontCaption),
     contentHeading: positiveInt(settings, "content_heading", fontHeading),
     contentDisplayLarge: positiveInt(settings, "content_display_large", fontDisplayLarge),
-    fdFlags: sanitizedFdFlags(rawFd),
-    fdOverrideArgs: rawFd.length > 0 ? fdOverrideArgs(rawFd) : null,
+    fdFlags: sanitizedFdFlags(safeFd),
+    fdOverrideArgs: safeFd.length > 0 ? fdOverrideArgs(safeFd) : null,
     browseDir: resolveBrowseDir(settings, home)
   }
 }
@@ -790,7 +812,10 @@ function thumbnailShellBody(path, outBase, storeDir, cacheLimit, renderSnippet, 
       + mid
       + close
   }
-  var gc = "ls -1t -- \"$store\" 2>/dev/null | tail -n +" + (keep + 1)
+  // .part files are concurrent saves in flight: they count toward no cap and
+  // must never be deleted out from under a publishing job.
+  var gc = "ls -1t -- \"$store\" 2>/dev/null | grep -v '\\.part$'"
+    + " | tail -n +" + (keep + 1)
     + " | while IFS= read -r f; do rm -f -- \"$store/$f\"; done"
   return head
     + " mt=$(stat -Lc %Y -- " + quoted + " 2>/dev/null);"
@@ -884,6 +909,7 @@ if (typeof module !== "undefined") {
     ignoredNames: ignoredNames,
     boolSetting: boolSetting,
     sanitizedFdFlags: sanitizedFdFlags,
+    hasExecFlag: hasExecFlag,
     fdFlagSegment: fdFlagSegment,
     fdOverrideArgs: fdOverrideArgs,
     fdClassifySnippet: fdClassifySnippet,
