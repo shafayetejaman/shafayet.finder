@@ -26,10 +26,8 @@ Item {
   property bool scanQueued: false
   property double lastScanFinishedAt: 0
 
-  // Identity (FinderModel.fdCacheKey) of the last COMPLETED live-fd run plus
-  // its full walk output. The walk carries NO fzf stage: every staged-text
-  // edit — typed or deleted — refilters fdBaseRows instantly in memory.
-  // Anything that changes the key re-walks after the normal fd debounce.
+  // Identity (fdCacheKey) of the last COMPLETED live-fd walk plus its full
+  // baseline; staged-text edits refilter it in memory. Key changes re-walk.
   property string lastFdKey: ""
   property var fdBaseRows: []
   property bool previewIsImage: false
@@ -37,37 +35,23 @@ Item {
   property string previewMeta: ""
   property string previewContent: ""
 
-  // path → { meta, content }, oldest-first key list for eviction. Read and
-  // written imperatively only, so no binding ever depends on it.
+  // path -> { meta, content }; oldest-first keys for LRU eviction.
   readonly property int previewCacheLimit: root.cfg.previewCacheLimit
   property var previewCache: ({})
   property var previewCacheKeys: []
-  // Scratch template for pdftoppm/ffmpeg jobs: each job mktemp -d's its own
-  // private mode-0700 directory ("<base>.XXXXXX"), renders inside it, and
-  // removes the directory afterwards, so concurrent or killed renders can
-  // never overwrite each other. The scratch itself never persists — the
-  // pixels do, in thumbStoreBase below.
+  // mktemp template for per-job private scratch dirs; nothing here persists.
   readonly property string pdfPngBase: home + "/.local/state/omarchy/file-finder-pdf"
-  // Persistent thumbnail store: rendered PDF pages and video frames survive
-  // shell restarts here, keyed by md5("<path>|<size>|<mtime>") so an edited
-  // source can never produce a stale hit. Honors XDG_CACHE_HOME; the plugin
-  // subdirectory keeps us clear of freedesktop-spec directories other apps
-  // own and garbage-collect by their own rules.
+  // Persistent thumbnail store, keyed md5("<path>|<size>|<mtime>") so an
+  // edited source can never hit stale. Plugin subdir avoids freedesktop-spec
+  // directories other apps own and garbage-collect.
   readonly property string thumbStoreBase: (Quickshell.env("XDG_CACHE_HOME") || home + "/.cache") + "/thumbnails/" + pluginId
-  // path → { url }, url being a self-contained data:image/png;base64 payload
-  // held in memory (rendered PDF pages AND extracted video frames). Storing
-  // bytes instead of pointing at a shared render file means an entry can
-  // never go stale under us — switching items overwrites nothing, so
-  // arrowing around always shows each one's own thumbnail. The first look of
-  // a session is served from thumbStoreBase instead of re-rendering.
+  // Self-contained data URLs so entries never go stale under us; the first
+  // look of a session is served from thumbStoreBase instead of re-rendering.
   readonly property int pdfCacheLimit: root.cfg.pdfCacheLimit
   property var pdfCache: ({})
   property var pdfCacheKeys: []
-  // Path whose preview the cold-start prewarm is currently fetching.
   property string prewarmKey: ""
 
-  // Shares the [menu] surface tokens — themes that style the menu also
-  // style the finder, matching the clipboard overlay's approach.
   property color background: Color.menu.background
   property color foreground: Color.menu.text
   property color border: Color.menu.border
@@ -87,15 +71,12 @@ Item {
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string pluginId: manifest && manifest.id ? String(manifest.id) : "shafayet.finder"
-  readonly property string listPath: home + "/.local/state/omarchy/file-finder-list.txt"
-  // Shown instead of nothing while the query is empty, so opening the finder
-  // doubles as a browser of a configurable directory (~/Downloads default).
+  readonly property string stateBase: home + "/.local/state/omarchy"
+  readonly property string listPath: root.stateBase + "/file-finder-list.txt"
+  // Empty-query browser directory (~/Downloads default).
   readonly property string browseDir: root.cfg.browseDir
 
-  // Settings come from this plugin's entry in shell.json plugins[]. Every
-  // tunable is merged over static defaults by resolveSettings, so the finder
-  // works untouched and each value stays individually overridable, e.g.
-  // { "id": "shafayet.finder", "search_dirs": ["$HOME"], "ignored_dirs": ["$HOME/.cache"] }
+  // This plugin's entry in shell.json plugins[].
   readonly property var pluginSettings: {
     var config = shell && shell.shellConfig ? shell.shellConfig : null
     var entries = config && Array.isArray(config.plugins) ? config.plugins : []
@@ -106,8 +87,6 @@ Item {
     return {}
   }
 
-  // Single source for every knob: search dirs, ignores, limits, pool size,
-  // debounce, PDF scale. See FinderModel.resolveSettings for the defaults.
   readonly property var cfg: FinderModel.resolveSettings(pluginSettings, home)
 
   function open(payloadJson) {
@@ -117,10 +96,8 @@ Item {
     root.cursorActive = true
     root.disarmPointer()
     root.clearPreview()
-    // The preview caches persist across toggles for the whole shell session,
-    // so revisiting a file re-shows its preview instantly. Thumbnails go one
-    // better: they persist across shell restarts on disk (thumbStoreBase),
-    // so even the first look of a session skips pdftoppm/ffmpeg entirely.
+    // Caches survive toggles for the session; thumbnails survive restarts on
+    // disk, so even a session's first look skips pdftoppm/ffmpeg.
     root.rebuildDisplay(true)
     root.refreshScan()
     searchDebounce.restart()
@@ -128,10 +105,7 @@ Item {
   }
 
   function close() {
-    // Blank immediately, cancel anything queued, and stop every process this
-    // session made stale: a pending debounce must not repaint the pane after
-    // the overlay is gone. The scan is left running on purpose — its result
-    // feeds the persistent list cache that makes the next open instant.
+    // The scan keeps running on purpose — its result feeds the persisted index.
     root.opened = false
     searchDebounce.stop()
     browseDebounce.stop()
@@ -139,12 +113,7 @@ Item {
     previewDebounce.stop()
     root.cancelPendingWork()
     root.clearPreview()
-    // Last session's rows must not flash under the empty filter on reopen.
-    // The PDF cache stays too: its entries are self-contained data URLs that
-    // reference no disk state, so they cannot go stale across sessions.
     root.searchResults = []
-    // The warm baseline lives only in memory, so a fresh session always
-    // starts with a real walk on its first flag query.
     root.lastFdKey = ""
     root.fdBaseRows = []
   }
@@ -154,19 +123,14 @@ Item {
     else root.open("{}")
   }
 
-  // Termination is asynchronous: a Process ignores `running = true` until it
-  // fully exits, so a fresh run requested mid-teardown queues itself and
-  // starts from onExited instead of being silently dropped.
+  // A Process ignores `running = true` until it fully exits, so work requested
+  // mid-teardown parks in queuedStart and launches from onExited instead of
+  // being silently dropped. Shared by searchProc/fdProc/preview workers.
   function refreshScan() {
-    // A scan already in flight (or queued behind a teardown) will land on
-    // its own — restarting it would only discard nearly-fresh work.
+    // An in-flight scan lands on its own; restarting discards fresh work.
     if (scanProc.running || root.scanQueued) return
     if (root.lastScanFinishedAt
-        && Date.now() - root.lastScanFinishedAt < root.cfg.rescanIntervalMs) {
-      // The index was rebuilt moments ago — skip the churn and keep serving
-      // the existing list; the next open past the interval rescans.
-      return
-    }
+        && Date.now() - root.lastScanFinishedAt < root.cfg.rescanIntervalMs) return
     root.scanSerial++
     scanProc.revision = root.scanSerial
     root.scanning = true
@@ -177,7 +141,7 @@ Item {
   function startScan() {
     if (!root.scanQueued) return
     root.scanQueued = false
-    scanProc.command = FinderModel.scanCommand(root.cfg)
+    scanProc.command = FinderModel.scanCommand(root.cfg, root.stateBase)
     scanProc.running = true
   }
 
@@ -190,18 +154,12 @@ Item {
     if (root.opened && root.filterText.trim()) searchDebounce.restart()
   }
 
-  // Called at shell start when the persisted list loads: the cached index is
-  // counted into memory immediately so the finder opens searchable without
-  // waiting for the first rescan. A refresh landing later simply overwrites
-  // this via applyScan.
+  // Cached index counted at startup so first searches need no rescan.
   function loadCachedList(raw) {
     root.fileListCount = FinderModel.markDirectories(String(raw || "")).length
   }
 
-  // Cold-start warm, stage 1: pick browse row 0 out of the listing and kick
-  // its normal preview builder. In-memory only — the payload parks in
-  // previewCache so the first launch of a session paints row 0 with zero
-  // fetch; nothing is written anywhere.
+  // Cold-start prewarm stage 1: dispatch row 0's normal preview builder.
   function warmFirstRow(raw) {
     var lines = String(raw || "").split("\n")
     for (var i = 0; i < lines.length; i++) {
@@ -220,8 +178,8 @@ Item {
     }
   }
 
-  // Cold-start warm, stage 2: store the fetched listing exactly like a live
-  // dispatch would (same meta wording), so the cache entry is indistinguishable.
+  // Stage 2: identical meta wording to a live dispatch, so the cache entry is
+  // indistinguishable.
   function storeWarmedPreview(raw) {
     var key = root.prewarmKey
     if (!key) return
@@ -257,9 +215,7 @@ Item {
       return
     }
 
-    // Inline fd flags route to a live walk over the roots themselves — the
-    // persisted index is irrelevant there. A flags-only query (no pattern)
-    // runs nothing and clears instantly.
+    // Flag queries walk the roots live — the persisted index is irrelevant.
     var parsed = FinderModel.parseQuery(query)
     if (parsed.args.length > 0) {
       if (!parsed.fdPattern) {
@@ -277,8 +233,7 @@ Item {
     }
 
     root.searchSerial++
-    // Searching is allowed even while a rescan is in flight: the persisted
-    // list from the previous scan stays valid until the new one lands.
+    // The previous scan's list stays valid until the new one lands.
     if (root.fileListCount === 0) {
       root.searchResults = []
       root.rebuildDisplay()
@@ -290,8 +245,7 @@ Item {
     else searchProc.running = false
   }
 
-  // Revalidates at actual start time: whatever the filter is THEN is what
-  // runs, so a query superseded during teardown never launches stale.
+  // Revalidated at actual start time so superseded queries never launch stale.
   function startSearch() {
     if (!searchProc.queuedStart) return
     searchProc.queuedStart = false
@@ -302,27 +256,21 @@ Item {
     searchProc.running = true
   }
 
-  // Same teardown-safe queueing as startSearch, but re-parses so a parked
-  // job only launches when its input still carries fd flags with a pattern.
   function startFdSearch() {
     if (!fdProc.queuedStart) return
     fdProc.queuedStart = false
     var parsed = FinderModel.parseQuery(root.filterText.trim())
     if (!root.opened || parsed.args.length === 0 || !parsed.fdPattern) return
-    // Stamp what actually launches; only a finished run promotes this to
-    // lastFdKey, so typing during the walk can never poison the warm path.
+    // Only a finished run promotes pendingKey to lastFdKey, so typing during
+    // the walk can never poison the warm path.
     fdProc.pendingKey = FinderModel.fdCacheKey(root.cfg, parsed)
     fdProc.revision = root.fdSerial
-    // The walk itself is uncapped by display size — its output is the whole
-    // baseline the warm path filters against.
     fdProc.command = FinderModel.liveFdCommand(root.cfg, parsed, root.cfg.maxScanResults)
     fdProc.running = true
   }
 
-  // immediatePreview: launch-only fast path. open() rebuilds the display
-  // before any typing, so the first row's preview dispatches right away
-  // instead of riding the keystroke debounce; every other caller keeps the
-  // default coalescing.
+  // immediatePreview: open() dispatches row 0 instantly instead of riding the
+  // keystroke debounce; other callers keep coalescing.
   function rebuildDisplay(immediatePreview) {
     var rows = root.searchResults ? root.searchResults : []
 
@@ -339,17 +287,14 @@ Item {
     }
 
     if (displayModel.count === 0) {
-      // An empty result set must not keep the last preview on screen:
-      // clear unconditionally, since selectedIndex may not actually change
-      // (it was often already 0) and its signal would then never fire.
+      // Clear even when selectedIndex doesn't change (often already 0): its
+      // signal would never fire.
       selectedIndex = 0
       root.clearPreview()
     }
     else if (selectedIndex >= displayModel.count) selectedIndex = displayModel.count - 1
     else if (selectedIndex < 0) selectedIndex = 0
 
-    // A fresh result set keeps the selection index unchanged, so the index
-    // change signal alone would never preview the first row.
     if (displayModel.count > 0) {
       if (immediatePreview) root.requestPreview()
       else previewDebounce.restart()
@@ -380,14 +325,12 @@ Item {
     resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
   }
 
-  // Staged text of the current flag query, if it is one; "" otherwise.
   function fdStagedText() {
     var p = FinderModel.parseQuery(root.filterText.trim())
     return (p.args.length > 0 && p.fdPattern) ? String(p.fzfQuery || "") : ""
   }
 
-  // Displays the baseline filtered by the current staged text. Warm path:
-  // same-key keystrokes land here with zero latency and never clear rows.
+  // Warm path: same-key edits land here with zero latency, never clearing rows.
   function refreshFlagDisplay() {
     root.searchResults = FinderModel.fuzzyFilterRows(root.fdBaseRows, fdStagedText())
       .slice(0, root.cfg.maxDisplayRows)
@@ -399,42 +342,35 @@ Item {
     root.selectedIndex = 0
     root.cursorActive = true
     root.disarmPointer()
-    // Every keystroke makes every in-flight search/browse/preview stale:
-    // stop them now instead of letting them run to an invisible finish.
+    // Every keystroke makes in-flight search/browse/preview stale — kill now.
     root.cancelPendingWork()
     searchDebounce.stop()
     fdDebounce.stop()
     var parsed = FinderModel.parseQuery(nextFilter)
-    // Leaving flag mode (empty query -> browse, or flags-only clearing)
-    // replaces the rows on screen with something else, so no completed run
-    // may serve as a warm baseline afterwards.
     if (parsed.args.length === 0 || !parsed.fdPattern) {
       root.lastFdKey = ""
       root.fdBaseRows = []
     }
     if (parsed.args.length > 0) {
       if (!parsed.fdPattern) {
-        // Flags-only: nothing to run, clear immediately for feedback.
         root.searchResults = []
         root.rebuildDisplay()
         return
       }
-      // Same walk as the completed run on screen: refilter the baseline in
-      // memory — instant whether words are added or removed, no clearing.
+      // Same walk as displayed: refilter the baseline in memory — instant in
+      // both directions, no clearing.
       var key = FinderModel.fdCacheKey(root.cfg, parsed)
       if (key !== "" && key === root.lastFdKey) {
         refreshFlagDisplay()
         return
       }
-      // Flag mode walks real trees: a slower debounce keeps the churn down.
       fdDebounce.restart()
       return
     }
     searchDebounce.restart()
   }
 
-  // Orphans the serials of anything in flight so late output can never land,
-  // then SIGTERMs the processes themselves to free CPU and disk at once.
+  // Orphan serials so late output can never land, then SIGTERM to free CPU/disk.
   function cancelPendingWork() {
     root.searchSerial++
     searchProc.revision = root.searchSerial
@@ -451,8 +387,7 @@ Item {
     root.killPreviewWorkers()
   }
 
-  // Shared tail for every result producer: absolute-path lines only, capped,
-  // straight into the display. Directories keep their trailing "/" marker.
+  // Shared tail for browse/search arrivals: absolute-path lines only, capped.
   function applyPathLines(raw) {
     var rows = []
     var lines = String(raw || "").split("\n")
@@ -461,9 +396,8 @@ Item {
       if (line.length > 1 && line.charAt(0) === "/") rows.push(line)
     }
     root.searchResults = rows
-    // Browse fills (empty query) happen on open/rescan, never per keystroke,
-    // so their row-0 preview skips the keystroke debounce. Search arrivals
-    // while typing keep the default coalescing.
+    // Browse fills happen on open/rescan, never per keystroke, so their row-0
+    // preview skips the keystroke debounce.
     root.rebuildDisplay(root.filterText.trim() === "")
   }
 
@@ -475,8 +409,7 @@ Item {
         worker.cooldown = true
         worker.running = false
       } else {
-        // Not running: a parked job here can never be pumped (no pending
-        // onExited), so drop it instead of leaking a phantom-busy slot.
+        // Parked job here can never be pumped (no pending onExited) — drop it.
         worker.queuedStart = false
       }
     }
@@ -518,8 +451,6 @@ Item {
     Util.execDetached("nautilus --select " + Util.shellQuote(FinderModel.cleanPath(row.path)))
   }
 
-  // Moves the selected row to the freedesktop trash via trash-cli so it can
-  // be restored; closes first, mirroring open/copy/reveal.
   function trashIndex(index) {
     var row = activeRow(index)
     if (!row) return
@@ -533,7 +464,7 @@ Item {
     return hit
   }
 
-  // Moves a key to the tail on hit so eviction follows real recency (LRU).
+  // Moves a key to the tail on hit so eviction follows real recency.
   function touchPreviewCache(path) {
     var keys = root.previewCacheKeys
     var idx = keys.indexOf(path)
@@ -560,7 +491,6 @@ Item {
     return hit
   }
 
-  // Moves a key to the tail on hit so eviction follows real recency (LRU).
   function touchPdfCache(path) {
     var keys = root.pdfCacheKeys
     var idx = keys.indexOf(path)
@@ -608,7 +538,6 @@ Item {
         root.prefetchNeighbors()
         return
       }
-      // Frame extraction is ffmpeg-heavy like PDF renders: not prefetched.
       root.dispatchPreview("video", cleanVideo, marked, FinderModel.buildVideoThumbnailCommand(cleanVideo, root.pdfPngBase, root.thumbStoreBase, root.cfg.thumbnailCacheLimit, root.cfg.pdfRenderScale))
       return
     }
@@ -647,7 +576,6 @@ Item {
         root.previewContent = ""
         return
       }
-      // PDF renders are heavy; not prefetched, so no neighbor pass here.
       root.dispatchPreview("pdf", cleanPdf, marked, FinderModel.buildPdfPreviewCommand(cleanPdf, root.pdfPngBase, root.thumbStoreBase, root.cfg.thumbnailCacheLimit, root.cfg.pdfRenderScale))
       return
     }
@@ -665,7 +593,8 @@ Item {
 
   Component.onCompleted: {
     ensurePool()
-    mkdirProc.running = true
+    // Scan folds its state-dir mkdir, so no dedicated startup process is needed.
+    root.refreshScan()
     warmRowProc.command = ["bash", "-c",
       "( " + FinderModel.browseCommand(root.cfg)[2] + " ) 2>/dev/null | head -n 4"]
     warmRowProc.running = true
@@ -689,15 +618,6 @@ Item {
     onLoadFailed: root.loadCachedList("")
   }
 
-  Process {
-    id: mkdirProc
-    command: ["bash", "-c", "mkdir -p \"$HOME/.local/state/omarchy\""]
-    onExited: root.refreshScan()
-  }
-
-  // Cold-start prewarm chain: runs ONCE at shell start, then never again —
-  // no timers, no idle cost. Stage 1 resolves browse row 0; stage 2 runs its
-  // ordinary preview command and parks the payload in previewCache.
   Process {
     id: warmRowProc
     stdout: StdioCollector {
@@ -732,8 +652,7 @@ Item {
     onTriggered: root.requestSearch()
   }
 
-  // Flag mode walks real directory trees, so it debounces slower than the
-  // plain fzf path — every keystroke still kills the previous run eagerly.
+  // Flag walks hit real directory trees: slower debounce than plain fzf.
   Timer {
     id: fdDebounce
     interval: root.cfg.fdDebounceMs
@@ -772,8 +691,6 @@ Item {
     }
   }
 
-  // Live fd-flag search: same queue-on-teardown lifecycle as searchProc,
-  // but the walk runs against the roots themselves instead of the index.
   Process {
     id: fdProc
     property int revision: -1
@@ -784,8 +701,7 @@ Item {
       waitForEnd: true
       onStreamFinished: {
         if (fdProc.revision !== root.fdSerial) return
-        // Baseline = every line of the capped walk; what's DISPLAYED is the
-        // baseline filtered by whatever the staged text is right now.
+        // Baseline = every walk line; what's displayed filters it client-side.
         var rows = []
         var lines = String(text).split("\n")
         for (var i = 0; i < lines.length; i++) {
@@ -804,14 +720,9 @@ Item {
     onTriggered: root.requestPreview()
   }
 
-  // Preview workers run concurrently so a slow PDF render never serializes
-  // behind directory listings or text heads, and prefetched neighbors land
-  // while the selected row is still being read. Results are keyed by path,
-  // so a killed stale worker's partial output can only ever populate the
-  // cache for its own file — display updates additionally require the
-  // worker's row to still be selected. Dispatches queue through onExited
-  // (like searchProc) so a job aimed at a mid-teardown worker is never
-  // silently dropped.
+  // Concurrent pool so a slow PDF render never blocks text previews. Results
+  // are keyed by path and display requires the row still selected, so a killed
+  // worker's partial output can never mispaint.
   Component {
     id: previewWorkerComp
 
@@ -820,17 +731,12 @@ Item {
       property string kind: "file"
       property string currentPath: ""
       property string displayKey: ""
-      // Set when the worker is killed mid-run so its truncated output can
-      // never populate the cache.
+      // Killed mid-run: truncated output must never populate the cache.
       property bool cancelled: false
-      // A Process ignores `running = true` until it fully exits, so a fresh
-      // job requested mid-teardown parks here and starts from onExited.
       property bool queuedStart: false
-      // Must stay a var: the command is an argv array, and a string-typed
-      // property would coerce it into one mangled token no binary matches.
+      // Must stay a var: an argv array coerced through a string-typed
+      // property would become one mangled token no binary matches.
       property var jobCommand: null
-      // True from kill until the process has fully exited; idle selection
-      // skips cooled-down workers so a start can never land mid-teardown.
       property bool cooldown: false
       onExited: {
         worker.cooldown = false
@@ -853,7 +759,6 @@ Item {
     }
   }
 
-  // Idle = fully exited, not holding a queued job, and not cooling down.
   function idlePreviewWorker() {
     for (var i = 0; i < previewPool.length; i++) {
       var worker = previewPool[i]
@@ -865,8 +770,7 @@ Item {
   function dispatchPreview(kind, cachePath, forKey, command) {
     var worker = root.idlePreviewWorker()
     if (!worker) {
-      // All slots busy: retry shortly rather than queueing work that may be
-      // stale by the time a slot frees up.
+      // Retry shortly rather than queueing possibly-stale work.
       previewDebounce.restart()
       return
     }
@@ -879,9 +783,6 @@ Item {
     root.pumpPreviewWorker(worker)
   }
 
-  // Starts a queued job on a fully-exited worker. Jobs parked while the
-  // worker was mid-teardown are pumped from onExited instead of being
-  // silently dropped.
   function pumpPreviewWorker(worker) {
     if (!worker.queuedStart || worker.running || worker.cooldown) return
     worker.queuedStart = false
@@ -890,9 +791,8 @@ Item {
     worker.running = true
   }
 
-  // Renders adjacent rows' previews into the cache ahead of time using spare
-  // workers, so arrowing through results feels instantaneous. Images need no
-  // process, and video/PDF renders cost more than background churn is worth.
+  // Spare workers warm adjacent rows ahead of time. Images need no process;
+  // PDF/video renders cost more than background churn is worth.
   function prefetchNeighbors() {
     for (var d = -1; d <= 1; d += 2) {
       var idx = root.selectedIndex + d
@@ -918,8 +818,6 @@ Item {
     var selectedRow = activeRow(root.selectedIndex)
     var isSelected = selectedRow !== null && worker.displayKey !== "" && worker.displayKey === selectedRow.path
 
-    // Rendered-thumbnail jobs (PDF pages, video frames) share one wire
-    // format and one bounded cache; only the producing command differs.
     if (worker.kind === "pdf" || worker.kind === "video") {
       if (parsed.size === -1) {
         if (isSelected) {
@@ -929,9 +827,7 @@ Item {
         }
         return
       }
-      // Oversized renders are refused producer-side (-3) and re-checked here
-      // before any data URL exists. Left uncached, so lowering
-      // pdf_render_scale (or fixing the file) succeeds on the next look.
+      // Left uncached so lowering pdf_render_scale succeeds next time.
       var url = FinderModel.pdfDataUrl(parsed.content)
       if (parsed.size === -3 || url === "") {
         if (isSelected) {
@@ -943,7 +839,6 @@ Item {
       }
       root.storePdfInCache(worker.currentPath, url)
       if (isSelected) {
-        // No meta line for PDFs: the page thumbnail owns the whole pane.
         root.previewIsImage = true
         root.previewSource = url
         root.previewMeta = ""
@@ -963,7 +858,7 @@ Item {
       return
     }
     if (parsed.size === -1) {
-      // Uncached so a file that reappears gets a fresh attempt.
+      // Uncached so a reappearance gets a fresh attempt.
       if (isSelected) {
         root.previewMeta = "Unreadable file"
         root.previewContent = ""
@@ -987,11 +882,8 @@ Item {
     }
   }
 
-  // Tries to render the selected row without spawning anything: images and
-  // videos are direct sources, and dir/file/PDF previews may already sit in
-  // the LRU (prefetched neighbors, revisits). Returns false when a worker
-  // would be needed, letting the caller fall back to the debounce. Mirrors
-  // the instant branches of requestPreview().
+  // Zero-spawn fast path mirroring requestPreview's cached branches; returns
+  // false when a worker is needed, letting the caller fall back to debounce.
   function showCachedPreview() {
     if (!root.opened || displayModel.count === 0) {
       root.clearPreview()
@@ -1096,8 +988,7 @@ Item {
             else root.close()
             event.accepted = true
           } else if (event.key === Qt.Key_Backspace && (event.modifiers & Qt.ControlModifier)) {
-            // Intercepted ahead of Util.editsFilter so the shell's plain
-            // backspace handling never eats the modifier variant.
+            // Must run before Util.editsFilter or plain backspace eats Ctrl.
             root.setFilter(FinderModel.deleteLastWord(root.filterText))
             event.accepted = true
           } else if (Util.editsFilter(event, root.filterText)) {

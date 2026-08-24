@@ -150,6 +150,14 @@ ok(s.indexOf("--hidden") !== -1 && s.indexOf("--hidden") < s.indexOf('. "${__p[@
 // empty searchDirs -> valid no-op
 eq(M.scanCommand(M.resolveSettings({ ignored_dirs: ["$HOME"] }, HOME)), ["bash", "-c", ""], "no roots -> no-op")
 
+// optional stateDir: folds directory creation into the classic scan command
+// itself so the persisted index never needs a dedicated mkdir process
+s = M.scanCommand(classic, "/state/dir")[2]
+ok(s.indexOf("mkdir -p -- '/state/dir'; ( { __p=() ;") === 0, "classic scan creates state dir first")
+eq(fdInvocationCount(s), 1, "state-dir prefix adds no second fd invocation")
+eq(M.scanCommand(M.resolveSettings({ ignored_dirs: ["$HOME"] }, HOME), "/state/dir"), ["bash", "-c", "mkdir -p -- '/state/dir'; "],
+  "no roots still makes the state dir")
+
 // ================= scan: override mode =================
 
 var over = M.resolveSettings({
@@ -162,6 +170,9 @@ ok(s.indexOf("'--hidden'") !== -1, "override flags verbatim")
 ok(s.indexOf("'--absolute-path'") !== -1, "override auto-appends --absolute-path")
 ok(s.indexOf("'--exclude' 'node_modules'") !== -1, "policy excludes enforced in override mode")
 ok(s.indexOf(". \"${__p[@]}\"") !== -1, "roots stay builder-owned positionals")
+s = M.scanCommand(over, "/state/dir")[2]
+ok(s.indexOf("mkdir -p -- '/state/dir'; ") === 0 && s.indexOf("fd ") !== -1,
+  "override scan creates state dir first")
 
 // ================= browse =================
 
@@ -224,6 +235,11 @@ ok(pc[2].indexOf("printf '\\t-1\\t\\n'") !== -1, "unreadable marker present")
 ok(pc[2].indexOf("rm -rf -- \"$tmpd\";") !== -1, "private scratch dir cleaned up")
 eq(M.buildPdfPreviewCommand("/my pdf.pdf", "/tmp/base", undefined, undefined, 800)[2], pc[2],
   "legacy two-arg call still accepted (persistence off)")
+eq(M.parentDir("/a/b/c.png"), "/a/b", "parentDir strips file")
+eq(M.parentDir("/top"), "/", "parentDir of top-level is slash root")
+eq(M.parentDir("relative"), ".", "parentDir of bare name stays relative")
+ok(pc[2].indexOf("mkdir -p -- '/tmp' 2>/dev/null; tmpd=$(mktemp -d -- '/tmp/base'.XXXXXX)") !== -1,
+  "legacy job guarantees its own scratch base directory")
 
 // Persistent store: hit fast path, staleness-keyed name, atomic save, GC.
 var pcs = M.buildPdfPreviewCommand("/my pdf.pdf", "/tmp/base", "/store/pdf", 500, 800)
@@ -241,6 +257,10 @@ ok(pcs[2].indexOf("tail -n +501") !== -1, "GC prunes beyond the configured cap")
 ok(pcs[2].indexOf("-le " + M.thumbPngByteCeiling) !== -1, "ceiling still enforced when persisting")
 ok(pcs[2].indexOf("if [ -n \"$thumb\" ]; then") !== -1,
   "save and GC skipped entirely when the store is unavailable")
+ok(pcs[2].indexOf("mkdir -p -- '/tmp' 2>/dev/null; tmpd=$(mktemp -d -- '/tmp/base'.XXXXXX)") !== -1,
+  "persisting job guarantees its own scratch base directory")
+ok(pcs[2].indexOf('base64 -w0 -- "$thumb"; exit 0; fi; mkdir -p') !== -1,
+  "cache hits skip the scratch entirely")
 
 // ================= misc regressions =================
 
