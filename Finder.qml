@@ -24,14 +24,11 @@ Item {
   property int fdSerial: 0
   property bool scanQueued: false
   property double lastScanFinishedAt: 0
-  // Component creation time. Early post-restart walks have been observed
-  // truncating (fd dying mid-walk during the shell startup storm) and their
-  // output would clobber the good on-disk index, so the first rescan waits
-  // out one full interval while a disk-loaded index exists.
+  // Creation time; early post-restart walks truncate, so the first rescan
+  // waits one interval while a disk-loaded index exists (see refreshScan).
   property double startedAt: Date.now()
-  // Index-write dedup state: what the on-disk file currently holds and
-  // whether it was actually read from disk (a failed load must not suppress
-  // the first write).
+  // On-disk index dedup: file text + whether it was truly disk-loaded (a
+  // failed load must not suppress the first write).
   property string lastIndexedText: ""
   property bool lastIndexFromDisk: false
   // Consecutive refused (dead/partial) walks; drives the bounded self-retry.
@@ -41,10 +38,8 @@ Item {
   // baseline; staged-text edits refilter it in memory. Key changes re-walk.
   property string lastFdKey: ""
   property var fdBaseRows: []
-  // Warm-refilter memo: { staged, matches, complete } from the previous pass.
-  // Typing extensions rescore only `matches` instead of the whole baseline;
-  // `complete` is false when the pass hit its cap (unknown tail), forcing a
-  // baseline rescan. Nulled wherever fdBaseRows is reassigned.
+  // Warm-refilter memo { staged, matches, complete }: extensions rescore only
+  // `matches`; complete=false past a cap hit. Nulled with fdBaseRows reassigns.
   property var fdWarmCache: null
   // Cap for full-baseline warm passes: big enough that ordinary match sets
   // stay complete (and thus narrowable) yet bounded for pathological queries.
@@ -59,9 +54,8 @@ Item {
   property string previewSource: ""
   property string previewMeta: ""
   property string previewContent: ""
-  // True while the selected row's preview is known-broken (unreadable file,
-  // over-ceiling render, undecodable image): the pane shows the placeholder
-  // instead of stale pixels. Reset whenever a fresh preview is requested.
+  // Selected row's preview is known-broken (unreadable, over-ceiling,
+  // undecodable): placeholder instead of stale pixels; reset per request.
   property bool previewUnavailable: false
 
   // path -> { meta, content }; oldest-first keys for LRU eviction.
@@ -70,10 +64,8 @@ Item {
   property var previewCacheKeys: []
   // mktemp template for per-job private scratch dirs; nothing here persists.
   readonly property string pdfPngBase: home + "/.local/state/omarchy/file-finder-pdf"
-  // Persistent thumbnail store, split per kind into <base>/{pdf,video} and
-  // keyed md5("<path>|<size>|<mtime>|<inode>") so an edited source can never
-  // hit stale. Plugin subdir avoids freedesktop-spec
-  // directories other apps own and garbage-collect.
+  // Persistent thumbnail store, <base>/{pdf,video}, keyed md5 of
+  // path|size|mtime|inode so an edited source can never hit stale.
   readonly property string thumbStoreBase: (Quickshell.env("XDG_CACHE_HOME") || home + "/.cache") + "/thumbnails/" + pluginId
   // Self-contained data URLs so entries never go stale under us; the first
   // look of a session is served from thumbStoreBase instead of re-rendering.
@@ -159,17 +151,16 @@ Item {
     else root.open("{}")
   }
 
-  // A Process ignores `running = true` until it fully exits, so work requested
-  // mid-teardown parks in queuedStart and launches from onExited instead of
-  // being silently dropped. Shared by searchProc/fdProc/preview workers.
+  // A Process ignores `running = true` until fully exited: mid-teardown work
+  // parks in queuedStart and launches from onExited. Shared by search/fd/preview.
   function refreshScan() {
     // An in-flight scan lands on its own; restarting discards fresh work.
     if (scanProc.running || root.scanQueued) return
     if (root.lastScanFinishedAt
         && Date.now() - root.lastScanFinishedAt < root.cfg.rescanIntervalMs) return
-    // Startup grace: serve the disk-loaded cache until one rescan interval
-    // has elapsed (rescan_interval_ms 0 never blocks). Without this, an open
-    // seconds after a shell restart would scan-and-persist a truncated walk.
+    // Startup grace: serve the disk cache until one interval elapses
+    // (rescan_interval_ms 0 never blocks) — an early open must not scan-and-
+    // persist a truncated walk.
     if (root.lastIndexFromDisk && root.fileListCount > 0
         && Date.now() - root.startedAt < root.cfg.rescanIntervalMs) return
     root.scanSerial++
@@ -188,10 +179,8 @@ Item {
 
   function applyScan(raw, scanStderr) {
     var text = String(raw || "")
-    // A partially dead walk indexes only the surviving roots — an unmounted
-    // HDD would shrink the index to $HOME-only — and is never persisted, even
-    // when no index exists yet: staying empty beats shipping wrong results.
-    // Full walks always land.
+    // A partially dead walk (unmounted HDD shrinking the index to $HOME-only)
+    // is never persisted — staying empty beats shipping wrong results.
     var ratio = String(scanStderr || "").match(new RegExp(FinderModel.scanRootsMarker + "(\\d+)/(\\d+)"))
     var partial = !!ratio && parseInt(ratio[1], 10) < parseInt(ratio[2], 10)
     if (!text || partial) {
@@ -260,14 +249,14 @@ Item {
     // Oversize renders stay uncached so selecting the file later reports
     // "Thumbnail too large" instead of serving an empty warmed entry.
     if (parsed.size === -3) return
-    var meta
-    if (parsed.size === -2) {
-      var items = parseInt(parsed.mtime, 10)
-      meta = "Directory — " + (isNaN(items) ? "?" : items) + " items"
-    } else {
-      meta = FinderModel.formatBytes(parsed.size)
-    }
+    var meta = parsed.size === -2 ? root.dirMeta(parsed.mtime) : FinderModel.formatBytes(parsed.size)
     root.storePreviewInCache(key, meta, parsed.content)
+  }
+
+  // Directory caption wording shared by warmed and live previews.
+  function dirMeta(countText) {
+    var items = parseInt(countText, 10)
+    return "Directory — " + (isNaN(items) ? "?" : items) + " items"
   }
 
   function startBrowse() {
@@ -414,12 +403,9 @@ Item {
     return (p.args.length > 0 && p.fdPattern) ? String(p.fzfQuery || "") : ""
   }
 
-  // Warm path: same-key edits land here with zero latency, never clearing
-  // rows. Typing extensions rescore only the previous match set; anything
-  // else rescans the baseline. Both share the generous cap so a finished
-  // pass stays marked complete even when many rows match — a display-sized
-  // cap would flip complete to false on nearly every step and force the
-  // next keystroke back onto the full baseline.
+  // Warm path: same-key edits land here with zero latency. The generous cap
+  // keeps finished passes `complete`; a display-sized one would flip complete
+  // every step and force full-baseline rescans on the next keystroke.
   function refreshFlagDisplay() {
     var staged = fdStagedText()
     var cache = root.fdWarmCache
@@ -582,13 +568,18 @@ Item {
 
   function cachedPreview(path) {
     var hit = root.previewCache[path] || null
-    if (hit) root.touchPreviewCache(path)
+    if (hit) root.lruTouch(root.previewCacheKeys, path)
+    return hit
+  }
+
+  function cachedPdf(path) {
+    var hit = root.pdfCache[path] || null
+    if (hit) root.lruTouch(root.pdfCacheKeys, path)
     return hit
   }
 
   // Moves a key to the tail on hit so eviction follows real recency.
-  function touchPreviewCache(path) {
-    var keys = root.previewCacheKeys
+  function lruTouch(keys, path) {
     var idx = keys.indexOf(path)
     if (idx < 0 || idx === keys.length - 1) return
     keys.splice(idx, 1)
@@ -597,40 +588,22 @@ Item {
 
   function storePreviewInCache(path, meta, content) {
     if (!path) return
-    var cache = root.previewCache
-    if (!cache[path]) {
-      var keys = root.previewCacheKeys.slice()
-      keys.push(path)
-      while (keys.length > root.previewCacheLimit) delete cache[keys.shift()]
-      root.previewCacheKeys = keys
-    }
-    cache[path] = { meta: meta, content: content }
-  }
-
-  function cachedPdf(path) {
-    var hit = root.pdfCache[path] || null
-    if (hit) root.touchPdfCache(path)
-    return hit
-  }
-
-  function touchPdfCache(path) {
-    var keys = root.pdfCacheKeys
-    var idx = keys.indexOf(path)
-    if (idx < 0 || idx === keys.length - 1) return
-    keys.splice(idx, 1)
-    keys.push(path)
+    root.storeLru(root.previewCache, root.previewCacheKeys, root.previewCacheLimit, path,
+      { meta: meta, content: content })
   }
 
   function storePdfInCache(path, url) {
     if (!path || !url) return
-    var cache = root.pdfCache
+    root.storeLru(root.pdfCache, root.pdfCacheKeys, root.pdfCacheLimit, path, { url: url })
+  }
+
+  // Generic LRU insert: evict oldest keys beyond the cap, then store.
+  function storeLru(cache, keys, limit, path, value) {
     if (!cache[path]) {
-      var keys = root.pdfCacheKeys.slice()
       keys.push(path)
-      while (keys.length > root.pdfCacheLimit) delete cache[keys.shift()]
-      root.pdfCacheKeys = keys
+      while (keys.length > limit) delete cache[keys.shift()]
     }
-    cache[path] = { url: url }
+    cache[path] = value
   }
 
   function clearPreview() {
@@ -649,80 +622,71 @@ Item {
     }
     // Fresh attempt: the placeholder only comes back if this preview fails.
     root.previewUnavailable = false
+    root.applyResolvedPreview(root.previewLookup(row.path), row.path)
+  }
 
-    var marked = row.path
-
+  // Shared decision tree for the selected row: resolved hit (image/thumb/text)
+  // or pool dispatch (workerKind + cachePath + command). Order matters — a
+  // directory named *.pdf must classify as a directory.
+  function previewLookup(marked) {
     if (FinderModel.isVideoPath(marked)) {
       var cleanVideo = FinderModel.cleanPath(marked)
       var videoHit = root.cachedPdf(cleanVideo)
-      if (videoHit) {
-        root.previewIsImage = true
-        root.previewSource = videoHit.url
-        root.previewMeta = ""
-        root.previewContent = ""
-        root.prefetchNeighbors()
-        return
-      }
-      root.dispatchPreview("video", cleanVideo, marked, FinderModel.buildVideoThumbnailCommand(cleanVideo, root.pdfPngBase, root.thumbStoreBase + "/video", root.cfg.thumbnailCacheLimit, root.cfg.pdfRenderScale))
-      return
+      if (videoHit) return { kind: "thumb", url: videoHit.url }
+      return { kind: "worker", workerKind: "video", cachePath: cleanVideo,
+        command: FinderModel.buildVideoThumbnailCommand(cleanVideo, root.pdfPngBase,
+          root.thumbStoreBase + "/video", root.cfg.thumbnailCacheLimit, root.cfg.pdfRenderScale) }
     }
-
     if (FinderModel.isImagePath(marked)) {
-      root.previewIsImage = true
-      root.previewSource = Util.fileUrl(marked)
-      root.previewMeta = ""
-      root.previewContent = ""
-      root.prefetchNeighbors()
-      return
+      return { kind: "image", url: Util.fileUrl(marked) }
     }
-    root.previewIsImage = false
-
     if (FinderModel.isDirPath(marked)) {
       var cleanDir = FinderModel.cleanPath(marked)
       var dirHit = root.cachedPreview(cleanDir)
-      if (dirHit) {
-        root.previewMeta = dirHit.meta
-        root.previewContent = dirHit.content
-        root.prefetchNeighbors()
-        return
-      }
-      root.dispatchPreview("dir", cleanDir, marked, FinderModel.buildDirPreviewCommand(cleanDir, root.cfg.previewByteLimit, root.cfg.showHidden))
-      root.prefetchNeighbors()
-      return
+      if (dirHit) return { kind: "text", isDir: true, meta: dirHit.meta, content: dirHit.content }
+      return { kind: "worker", workerKind: "dir", cachePath: cleanDir,
+        command: FinderModel.buildDirPreviewCommand(cleanDir, root.cfg.previewByteLimit, root.cfg.showHidden) }
     }
-
     if (FinderModel.isPdfPath(marked)) {
       var cleanPdf = FinderModel.cleanPath(marked)
       var pdfHit = root.cachedPdf(cleanPdf)
-      if (pdfHit) {
-        root.previewIsImage = true
-        root.previewSource = pdfHit.url
-        root.previewMeta = ""
-        root.previewContent = ""
-        root.prefetchNeighbors()
-        return
-      }
-      root.dispatchPreview("pdf", cleanPdf, marked, FinderModel.buildPdfPreviewCommand(cleanPdf, root.pdfPngBase, root.thumbStoreBase + "/pdf", root.cfg.thumbnailCacheLimit, root.cfg.pdfRenderScale))
-      return
+      if (pdfHit) return { kind: "thumb", url: pdfHit.url }
+      return { kind: "worker", workerKind: "pdf", cachePath: cleanPdf,
+        command: FinderModel.buildPdfPreviewCommand(cleanPdf, root.pdfPngBase,
+          root.thumbStoreBase + "/pdf", root.cfg.thumbnailCacheLimit, root.cfg.pdfRenderScale) }
     }
-
     var fileHit = root.cachedPreview(marked)
-    if (fileHit) {
-      root.previewMeta = fileHit.meta
-      root.previewContent = fileHit.content
-      root.previewUnavailable = fileHit.content === ""
-      root.prefetchNeighbors()
-      return
+    if (fileHit) return { kind: "text", isDir: false, meta: fileHit.meta, content: fileHit.content }
+    return { kind: "worker", workerKind: "file", cachePath: marked,
+      command: FinderModel.buildPreviewCommand(marked, root.cfg.previewByteLimit) }
+  }
+
+  // Paints a resolved preview, else hands it to the worker pool.
+  function applyResolvedPreview(p, displayKey) {
+    if (p.kind === "image" || p.kind === "thumb") {
+      root.previewIsImage = true
+      root.previewSource = p.url
+      root.previewMeta = ""
+      root.previewContent = ""
+    } else if (p.kind === "text") {
+      root.previewIsImage = false
+      root.previewMeta = p.meta
+      root.previewContent = p.content
+      // Empty directories preview fine; contentless files placeholder.
+      root.previewUnavailable = !p.isDir && p.content === ""
+    } else {
+      // Video/pdf renders keep the previous pane visible while working,
+      // exactly like the original inline branches did.
+      if (p.workerKind === "dir" || p.workerKind === "file") root.previewIsImage = false
+      root.dispatchPreview(p.workerKind, p.cachePath, displayKey, p.command)
     }
-    root.dispatchPreview("file", marked, marked, FinderModel.buildPreviewCommand(marked, root.cfg.previewByteLimit))
     root.prefetchNeighbors()
   }
 
   Component.onCompleted: {
     ensurePool()
-    // No startup scan here: listFile's load handlers decide between an
-    // immediate first-run walk (no cache) and the deferred startupScanTimer
-    // refresh that keeps early truncated walks from clobbering the index.
+    // No startup scan here: listFile's load handlers pick between an
+    // immediate first-run walk and the deferred startupScanTimer refresh.
     trashProbeProc.running = true
     warmRowProc.command = ["bash", "-c",
       "( " + FinderModel.browseCommand(root.cfg)[2] + " ) 2>/dev/null | head -n 4"]
@@ -763,9 +727,8 @@ Item {
     command: ["bash", "-c", "[ -f " + FinderModel.shellQuote(root.listPath) + " ]"]
     onExited: {
       if (exitCode === 0 || !root.lastIndexFromDisk) return
-      // Deleted mid-session: restore the in-memory copy so fzf keeps serving
-      // immediately, and let the next landed scan rewrite it fresh (the flag
-      // drop makes applyScan's write unconditional).
+      // Deleted mid-session: restore the in-memory copy for fzf; the flag
+      // drop makes applyScan's next write unconditional.
       root.lastIndexFromDisk = false
       if (root.lastIndexedText) listFile.setText(root.lastIndexedText)
     }
@@ -825,18 +788,16 @@ Item {
     onTriggered: root.startBrowse()
   }
 
-  // Heals a boot-time mount race without user interaction: refused walks
-  // re-scan every 10s for up to ~4 minutes, then yield to the normal
-  // open-triggered cadence so a permanently absent root cannot hot-loop.
+  // Heals boot-time mount races: refused walks retry every 10s for ~4 min,
+  // then yield to the open-triggered cadence so a dead root cannot hot-loop.
   Timer {
     id: partialScanRetry
     interval: 10000
     onTriggered: root.refreshScan()
   }
 
-  // First rescan of a session. Armed only when listFile loaded a non-empty
-  // index: the cache serves until this fires, so a truncated walk right
-  // after a shell restart can never overwrite it (see refreshScan's gate).
+  // First rescan of a session, armed only for a non-empty loaded index: the
+  // cache serves until this fires (see refreshScan's startup gate).
   Timer {
     id: startupScanTimer
     interval: root.cfg.rescanIntervalMs
@@ -900,9 +861,8 @@ Item {
     onTriggered: root.requestPreview()
   }
 
-  // Concurrent pool so a slow PDF render never blocks text previews. Results
-  // are keyed by path and display requires the row still selected, so a killed
-  // worker's partial output can never mispaint.
+  // Concurrent pool: slow renders never block text previews; results keyed by
+  // path and gated on the row still selected, so kills can never mispaint.
   Component {
     id: previewWorkerComp
 
@@ -1040,11 +1000,10 @@ Item {
     }
 
     if (parsed.size === -2) {
-      var items = parseInt(parsed.mtime, 10)
-      var dirMeta = "Directory — " + (isNaN(items) ? "?" : items) + " items"
-      root.storePreviewInCache(worker.currentPath, dirMeta, parsed.content)
+      var caption = root.dirMeta(parsed.mtime)
+      root.storePreviewInCache(worker.currentPath, caption, parsed.content)
       if (isSelected) {
-        root.previewMeta = dirMeta
+        root.previewMeta = caption
         root.previewContent = parsed.content
       }
       return
@@ -1088,55 +1047,12 @@ Item {
     var row = activeRow(root.selectedIndex)
     if (!row) return false
     root.previewUnavailable = false
-    var marked = row.path
-
-    if (FinderModel.isVideoPath(marked)) {
-      var videoHit = root.cachedPdf(FinderModel.cleanPath(marked))
-      if (videoHit) {
-        root.previewIsImage = true
-        root.previewSource = videoHit.url
-        root.previewMeta = ""
-        root.previewContent = ""
-        root.prefetchNeighbors()
-        return true
-      }
+    var p = root.previewLookup(row.path)
+    if (p.kind === "worker") {
+      if (p.workerKind === "dir" || p.workerKind === "file") root.previewIsImage = false
       return false
     }
-    if (FinderModel.isImagePath(marked)) {
-      root.previewIsImage = true
-      root.previewSource = Util.fileUrl(marked)
-      root.previewMeta = ""
-      root.previewContent = ""
-      root.prefetchNeighbors()
-      return true
-    }
-    root.previewIsImage = false
-
-    var hit = null
-    var isDir = FinderModel.isDirPath(marked)
-    if (isDir) {
-      hit = root.cachedPreview(FinderModel.cleanPath(marked))
-    } else if (FinderModel.isPdfPath(marked)) {
-      var pdfHit = root.cachedPdf(FinderModel.cleanPath(marked))
-      if (pdfHit) {
-        root.previewIsImage = true
-        root.previewSource = pdfHit.url
-        root.previewMeta = ""
-        root.previewContent = ""
-        root.prefetchNeighbors()
-        return true
-      }
-      return false
-    } else {
-      hit = root.cachedPreview(marked)
-    }
-    if (!hit) return false
-    root.previewMeta = hit.meta
-    root.previewContent = hit.content
-    // Empty directories preview fine (the caption says so); files with no
-    // renderable content show the placeholder.
-    root.previewUnavailable = !isDir && hit.content === ""
-    root.prefetchNeighbors()
+    root.applyResolvedPreview(p, row.path)
     return true
   }
 
@@ -1415,10 +1331,8 @@ font.pixelSize: root.cfg.contentCaption
                 smooth: true
                 onStatusChanged: {
                   if (root.previewSource === "") return
-                  // Any undecodable image must surface the placeholder. Error
-                  // alone is not enough: a Null status (data URL Qt refuses
-                  // without entering Error) would otherwise leave a silent
-                  // blank pane.
+                  // Any undecodable image must surface the placeholder: Error
+                  // alone misses Null, which would leave a silent blank pane.
                   if (status === Image.Error || status === Image.Null) root.previewUnavailable = true
                 }
               }

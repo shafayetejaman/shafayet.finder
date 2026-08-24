@@ -65,11 +65,8 @@ function sanitizedFdFlags(flags) {
   return out
 }
 
-// Any execution flag disqualifies a static override entirely: -x/--exec and
-// friends consume variable argument lists (up to ";"), so reliably excising
-// them is riskier than discarding the override. The search box already
-// demotes typed exec flags; config gets the same outcome by falling back to
-// the classic baseline.
+// -x/--exec consume variable argument lists, so excising them reliably is
+// riskier than discarding the override; config falls back to the classic baseline.
 function hasExecFlag(flags) {
   var source = Array.isArray(flags) ? flags : []
   for (var i = 0; i < source.length; i++) {
@@ -296,10 +293,8 @@ function guardedRootsSnippet(searchDirs, reportRatio) {
   return parts.join(" ; ")
 }
 
-// QML entry points: dispatch on whether fd_flags overrides. Policy excludes
-// are enforced in BOTH modes; both walk all roots in one relay-wrapped fd
-// invocation. Optional stateDir folds its mkdir into the command so the
-// persisted index can be written when the scan lands.
+// QML entry point: policy excludes enforced in both override and classic
+// modes; one relay-wrapped fd walk over all roots. stateDir folds its mkdir in.
 function scanCommand(cfg, stateDir) {
   var pre = stateDir ? "mkdir -p -- " + shellQuote(stateDir) + "; " : ""
   if (!cfg || !cfg.searchDirs || cfg.searchDirs.length === 0) return ["bash", "-c", pre]
@@ -309,8 +304,8 @@ function scanCommand(cfg, stateDir) {
     return ["bash", "-c",
       pre
       + guardedRootsSnippet(cfg.searchDirs, true) + " ; "
-      + "( { " + termRelay("fd " + argStr + (ex ? " " + ex : "") + " . \"${__p[@]}\" 2>/dev/null")
-      + " ; } 2>/dev/null ) | head -n " + cfg.maxScanResults]
+      + cappedRelay("fd " + argStr + (ex ? " " + ex : "") + " . \"${__p[@]}\" 2>/dev/null",
+        cfg.maxScanResults)]
   }
   return ["bash", "-c", pre + scanCommandClassic(cfg)[2]]
 }
@@ -323,8 +318,7 @@ function browseCommand(cfg) {
     var fdCmd = "fd " + argStr + (ex ? " " + ex : "") + " --min-depth 1 --max-depth 1 . " + quoted
     return ["bash", "-c",
       "{ [ -d " + quoted + " ] || exit 0 ; } ; "
-      + "( " + termRelay(fdCmd + " 2>/dev/null") + " | " + fdClassifySnippet(true) + " ) 2>/dev/null"
-      + " | head -n " + cfg.maxBrowseRows]
+      + classifiedRelay(fdCmd + " 2>/dev/null", cfg.maxBrowseRows)]
   }
   return browseCommandClassic(cfg)
 }
@@ -380,6 +374,21 @@ function termRelay(cmd) {
   return "{ " + cmd + " & __p=$!; trap 'kill -TERM \"$__p\" 2>/dev/null' TERM INT; wait \"$__p\"; }"
 }
 
+// Shared tail of every root walk: fd silenced inside the relay braces, output
+// capped by head (any truncated prefix stays a valid index/listing). The
+// optional prologue sits inside the braces only where callers need it there.
+function cappedRelay(fdCmd, cap, prologue) {
+  return "( { " + (prologue ? prologue + " ; " : "") + termRelay(fdCmd)
+    + " ; } 2>/dev/null ) | head -n " + cap
+}
+
+// Depth-limited browse variant: the relay feeds fdClassifySnippet so
+// directories list before files regardless of walk order.
+function classifiedRelay(fdCmd, cap) {
+  return "( " + termRelay(fdCmd) + " | " + fdClassifySnippet(true)
+    + " ) 2>/dev/null | head -n " + cap
+}
+
 // "@@DIRS@@" frames the file/dir chunks; absolute paths never start with "@",
 // so marker lines stay unambiguous against legacy cached indexes.
 var scanSectionMarker = "@@DIRS@@"
@@ -395,8 +404,7 @@ function scanCommandClassic(cfg) {
   flags += "--absolute-path "
   return ["bash", "-c",
     guardedRootsSnippet(cfg.searchDirs, true) + " ; "
-    + "( { " + termRelay("fd " + flags + ". \"${__p[@]}\" 2>/dev/null")
-    + " ; } 2>/dev/null ) | head -n " + cfg.maxScanResults]
+    + cappedRelay("fd " + flags + ". \"${__p[@]}\" 2>/dev/null", cfg.maxScanResults)]
 }
 
 // Marker lines from legacy framed cache files never start with "/", so old
@@ -440,12 +448,9 @@ function browseCommandClassic(cfg) {
   if (ex) flags += ex + " "
   return ["bash", "-c",
     "{ [ -d " + quoted + " ] || exit 0 ; } ; "
-    + "( "
-    + termRelay("fd " + flags + "--type directory --type file --absolute-path --min-depth 1 --max-depth 1 . " + quoted + " 2>/dev/null")
-    + " | " + fdClassifySnippet(true)
-    + " ) 2>/dev/null"
-    + " | head -n " + cfg.maxBrowseRows
-  ]
+    + classifiedRelay("fd " + flags
+      + "--type directory --type file --absolute-path --min-depth 1 --max-depth 1 . " + quoted + " 2>/dev/null",
+      cfg.maxBrowseRows)]
 }
 
 function buildSearchCommand(listPath, query, displayLimit) {
@@ -568,19 +573,15 @@ function liveFdCommand(cfg, parsed, cap) {
   if (!hasColorFlag(absArgs)) absArgs.push("--color=never")
   var argStr = shellJoin(absArgs).join(" ")
   var ex = combinedExcludeSegment(cfg)
-  var script = "( { " + guardedRootsSnippet(cfg.searchDirs) + " ; "
-    + termRelay("fd " + argStr + (ex ? " " + ex : "")
-      + " " + shellQuote(parsed.fdPattern || ".") + " \"${__p[@]}\" 2>/dev/null")
-    + " ; } 2>/dev/null )"
-  script += " | head -n " + cap
-  return ["bash", "-c", script]
+  return ["bash", "-c",
+    cappedRelay("fd " + argStr + (ex ? " " + ex : "")
+      + " " + shellQuote(parsed.fdPattern || ".") + " \"${__p[@]}\" 2>/dev/null",
+      cap, guardedRootsSnippet(cfg.searchDirs))]
 }
 
-// Identity of a live-fd run's expensive inputs. Deliberately excludes
-// fzfQuery: changing only staged text must count as the same run.
-// The settings signature is memoized on config object identity — QML rebuilds
-// cfg only when shell.json changes, so per-keystroke calls skip re-stringifying
-// every array. Mutating cfg in place would stale the memo; nothing does.
+// Live-fd run identity: config signature + args + pattern, deliberately
+// excluding fzfQuery (staged-text edits count as the same run). Memoized on
+// cfg object identity; mutating cfg in place would stale it — nothing does.
 var fdSigMemo = { cfg: null, sig: "" }
 
 function fdConfigSignature(cfg) {
@@ -638,13 +639,9 @@ function isWordChar(c) {
     || c === "_"
 }
 
-// fzf --filter-style filter: whitespace terms AND together independently;
-// ties keep input order. Blank query passes everything through. With a
-// positive finite limit only the best <limit> rows survive: candidates are
-// streamed past a bounded top-N selector whose strict-greater replacement
-// keeps the output identical to sorting everything and slicing, without the
-// full scored array or sort (the warm path runs this per keystroke over
-// six-figure baselines).
+// fzf --filter-style: terms AND together, ties keep input order, blank query
+// passes all. Bounded top-N selector keeps output identical to full sort+slice
+// without the scored array (runs per keystroke over six-figure baselines).
 function fuzzyFilterRows(rows, query, limit) {
   var list = Array.isArray(rows) ? rows : []
   var capped = typeof limit === "number" && isFinite(limit) && limit > 0
@@ -683,14 +680,9 @@ function fuzzyFilterRows(rows, query, limit) {
   return out
 }
 
-// Candidate set for the warm refilter. While typing EXTENDS the previous
-// staged text, every term of the longer query either extends a term of the
-// shorter one or is brand new, so whatever matched before is exactly the
-// plausible universe — narrowing never needs a baseline pass. Backspace,
-// mid-text edits and prefix breaks widen and must rescan. An incomplete
-// cache (the previous pass hit its cap, so matches beyond it are unknown)
-// and a blank predecessor also refuse; an empty match list stays usable
-// since zero matches stay zero under narrowing.
+// Warm-refilter universe: only while typing EXTENDS the previous staged text
+// is the old match set complete (narrowing needs no baseline pass); widening,
+// an incomplete cache or a blank predecessor refuse. Empty stays usable.
 function warmCandidates(matches, prevStaged, nextStaged, complete) {
   if (!complete || !Array.isArray(matches)) return null
   var prev = String(prevStaged == null ? "" : prevStaged)
@@ -809,9 +801,8 @@ function isVideoPath(path) {
   return /\.(mp4|mkv|webm|mov|avi|m4v|mpg|mpeg|wmv|flv|m2ts|ts|3gp|ogv)$/i.test(String(path || ""))
 }
 
-// Last 12 bytes of every complete PNG: IEND's length prefix, type and CRC.
-// Header-only checks ([ -s ], file(1)) accept truncated files, which older
-// plugin versions could publish — serving one yields a silent blank pane.
+// Last 12 bytes of every complete PNG (IEND length+type+CRC); header-only
+// checks accept truncated files, which older versions could publish.
 var pngEndMarker = "0000000049454e44ae426082"
 
 // Shell condition: true when the file's tail carries the PNG IEND trailer.
@@ -821,16 +812,12 @@ function pngCompleteTest(fileExpr) {
 }
 
 // Shared body for both thumbnail producers (PDF/video differ only in the
-// render snippet). Disk protocol: key = md5("<path>|<size>|<mtime>|<inode>")
-// so an edited or replaced source can never produce a false hit. Hit streams
-// the stored PNG and exits before any renderer or scratch dir runs; a stored
-// file failing the IEND check is deleted and falls through to a fresh render,
-// healing poison left by earlier versions. Miss renders privately and
-// publishes atomically (.part unlinked then renamed) only when within the
-// byte ceiling AND itself IEND-complete; oversized (-3), truncated and failed
-// (-1) results are never saved. After a save the store is pruned to the newest
-// <cacheLimit> files. An unavailable store degrades to render-without-persist.
-// Empty storeDir or limit <= 0 disables the disk layer entirely.
+// render snippet). Key = md5("<path>|<size>|<mtime>|<inode>") — an edited or
+// replaced source never hits stale. Hit: IEND-complete stored PNG streams and
+// exits before any renderer runs; corrupt entries are deleted for re-render.
+// Miss: private render, atomic .part publish only when within the byte ceiling
+// AND IEND-complete (-3 oversized, -1 failed/truncated are never saved), then
+// GC to the newest <cacheLimit>. No storeDir or limit <= 0 disables the disk.
 function thumbnailShellBody(path, outBase, storeDir, cacheLimit, renderSnippet, ceiling) {
   var quoted = shellQuote(path)
   var quotedBase = shellQuote(outBase)
@@ -884,10 +871,8 @@ function thumbnailShellBody(path, outBase, storeDir, cacheLimit, renderSnippet, 
     + close
 }
 
-// Renders page 1 into a private mode-0700 mktemp dir (concurrent or killed
-// renders can never touch each other) and reports "\t<size>\t" + base64 PNG.
-// pdftoppm is relay-wrapped to die on stale teardown. Scratch is removed even
-// after failed renders.
+// Page-1 render into a private mode-0700 mktemp dir; relay-wrapped so stale
+// teardown kills it. Scratch is removed even after failed renders.
 function buildPdfPreviewCommand(path, outBase, storeDir, cacheLimit, scale, ceiling) {
   if (scale === undefined) scale = pdfRenderScale
   if (!isFinite(ceiling) || ceiling <= 0) ceiling = thumbPngByteCeiling
@@ -905,9 +890,8 @@ function pdfDataUrl(b64) {
   return "data:image/png;base64," + s
 }
 
-// Same wire format/store/GC as the PDF producer. Seeks 1s in; clips shorter
-// than that (or without a decodable frame at 1s) retry from 0s. -nostdin
-// keeps ffmpeg from eating a collector's stdin.
+// Same wire/store/GC as the PDF producer; seeks 1s in, retries from 0s when
+// the clip is shorter or has no decodable frame. -nostdin protects collectors.
 function buildVideoThumbnailCommand(path, outBase, storeDir, cacheLimit, scale, ceiling) {
   if (scale === undefined) scale = pdfRenderScale
   if (!isFinite(ceiling) || ceiling <= 0) ceiling = thumbPngByteCeiling
