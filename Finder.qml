@@ -30,6 +30,9 @@ Item {
   // baseline; staged-text edits refilter it in memory. Key changes re-walk.
   property string lastFdKey: ""
   property var fdBaseRows: []
+  // Paths deleted this session; filtered out of every result producer so a
+  // trashed file never resurfaces before the next index rescan.
+  property var trashedPaths: ({})
   property bool previewIsImage: false
   property string previewSource: ""
   property string previewMeta: ""
@@ -332,8 +335,12 @@ Item {
 
   // Warm path: same-key edits land here with zero latency, never clearing rows.
   function refreshFlagDisplay() {
-    root.searchResults = FinderModel.fuzzyFilterRows(root.fdBaseRows, fdStagedText())
-      .slice(0, root.cfg.maxDisplayRows)
+    var rows = FinderModel.fuzzyFilterRows(root.fdBaseRows, fdStagedText())
+    var visible = []
+    for (var i = 0; i < rows.length; i++) {
+      if (!root.trashedPaths[rows[i]]) visible.push(rows[i])
+    }
+    root.searchResults = visible.slice(0, root.cfg.maxDisplayRows)
     root.rebuildDisplay()
   }
 
@@ -393,7 +400,7 @@ Item {
     var lines = String(raw || "").split("\n")
     for (var i = 0; i < lines.length && rows.length < root.cfg.maxDisplayRows; i++) {
       var line = lines[i]
-      if (line.length > 1 && line.charAt(0) === "/") rows.push(line)
+      if (line.length > 1 && line.charAt(0) === "/" && !root.trashedPaths[line]) rows.push(line)
     }
     root.searchResults = rows
     // Browse fills happen on open/rescan, never per keystroke, so their row-0
@@ -454,8 +461,17 @@ Item {
   function trashIndex(index) {
     var row = activeRow(index)
     if (!row) return
-    root.close()
     Util.execDetached("trash-put " + Util.shellQuote(FinderModel.cleanPath(row.path)))
+    root.trashedPaths[row.path] = true
+    // Stay open: drop the trashed row and let the selection fall on the next
+    // entry, so several files can be removed in one pass.
+    var remaining = []
+    var results = root.searchResults || []
+    for (var i = 0; i < results.length; i++) {
+      if (results[i] !== row.path) remaining.push(results[i])
+    }
+    root.searchResults = remaining
+    root.rebuildDisplay(true)
   }
 
   function cachedPreview(path) {
