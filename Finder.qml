@@ -24,6 +24,11 @@ Item {
   property int fdSerial: 0
   property bool scanQueued: false
   property double lastScanFinishedAt: 0
+  // Component creation time. Early post-restart walks have been observed
+  // truncating (fd dying mid-walk during the shell startup storm) and their
+  // output would clobber the good on-disk index, so the first rescan waits
+  // out one full interval while a disk-loaded index exists.
+  property double startedAt: Date.now()
   // Index-write dedup state: what the on-disk file currently holds and
   // whether it was actually read from disk (a failed load must not suppress
   // the first write).
@@ -162,6 +167,11 @@ Item {
     if (scanProc.running || root.scanQueued) return
     if (root.lastScanFinishedAt
         && Date.now() - root.lastScanFinishedAt < root.cfg.rescanIntervalMs) return
+    // Startup grace: serve the disk-loaded cache until one rescan interval
+    // has elapsed (rescan_interval_ms 0 never blocks). Without this, an open
+    // seconds after a shell restart would scan-and-persist a truncated walk.
+    if (root.lastIndexFromDisk && root.fileListCount > 0
+        && Date.now() - root.startedAt < root.cfg.rescanIntervalMs) return
     root.scanSerial++
     scanProc.revision = root.scanSerial
     root.scanning = true
@@ -710,8 +720,9 @@ Item {
 
   Component.onCompleted: {
     ensurePool()
-    // Scan folds its state-dir mkdir, so no dedicated startup process is needed.
-    root.refreshScan()
+    // No startup scan here: listFile's load handlers decide between an
+    // immediate first-run walk (no cache) and the deferred startupScanTimer
+    // refresh that keeps early truncated walks from clobbering the index.
     trashProbeProc.running = true
     warmRowProc.command = ["bash", "-c",
       "( " + FinderModel.browseCommand(root.cfg)[2] + " ) 2>/dev/null | head -n 4"]
@@ -735,10 +746,15 @@ Item {
     onLoaded: {
       root.lastIndexFromDisk = true
       root.loadCachedList(text())
+      // A usable cached index is displayed as-is and refreshed only after
+      // one full rescan interval; an empty file still needs a walk now.
+      if (root.fileListCount > 0) startupScanTimer.restart()
+      else root.refreshScan()
     }
     onLoadFailed: {
       root.lastIndexFromDisk = false
       root.loadCachedList("")
+      root.refreshScan()
     }
   }
 
@@ -815,6 +831,15 @@ Item {
   Timer {
     id: partialScanRetry
     interval: 10000
+    onTriggered: root.refreshScan()
+  }
+
+  // First rescan of a session. Armed only when listFile loaded a non-empty
+  // index: the cache serves until this fires, so a truncated walk right
+  // after a shell restart can never overwrite it (see refreshScan's gate).
+  Timer {
+    id: startupScanTimer
+    interval: root.cfg.rescanIntervalMs
     onTriggered: root.refreshScan()
   }
 
