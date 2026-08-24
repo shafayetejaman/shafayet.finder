@@ -55,6 +55,10 @@ eq(M.resolveSettings({}, HOME).pdfRenderScale, M.pdfRenderScale, "default render
 eq(M.resolveSettings({ pdf_render_scale: 100000 }, HOME).pdfRenderScale, 4000, "render scale clamps high")
 eq(M.resolveSettings({ pdf_render_scale: 1 }, HOME).pdfRenderScale, 64, "render scale clamps low")
 eq(M.resolveSettings({ pdf_render_scale: "abc" }, HOME).pdfRenderScale, M.pdfRenderScale, "garbage render scale falls back")
+eq(M.resolveSettings({}, HOME).thumbnailCacheLimit, M.thumbnailCacheLimit, "default thumbnail store cap")
+eq(M.resolveSettings({ thumbnail_cache_limit: 0 }, HOME).thumbnailCacheLimit, 0, "zero opts out of thumbnail persistence")
+eq(M.resolveSettings({ thumbnail_cache_limit: -5 }, HOME).thumbnailCacheLimit, M.thumbnailCacheLimit, "negative cap falls back to default")
+eq(M.resolveSettings({ thumbnail_cache_limit: "abc" }, HOME).thumbnailCacheLimit, M.thumbnailCacheLimit, "garbage thumbnail cap falls back")
 
 // ================= overlapping root pruning =================
 
@@ -207,7 +211,7 @@ eq(M.pdfDataUrl(""), "", "pdf data url rejects empty payload")
 var oversize = new Array(Math.ceil(M.thumbPngByteCeiling / 3) * 4 + 2).join("A")
 eq(M.pdfDataUrl(oversize), "", "pdf data url rejects over-ceiling payload")
 
-var pc = M.buildPdfPreviewCommand("/my pdf.pdf", "/tmp/base", 800)
+var pc = M.buildPdfPreviewCommand("/my pdf.pdf", "/tmp/base", "", 0, 800)
 ok(pc[2].indexOf("pdftoppm -png -f 1 -singlefile -scale-to 800 '/my pdf.pdf' \"${tmp%.png}\"") !== -1,
   "pdf render targets per-job scratch outbase")
 ok(pc[2].indexOf("umask 077;") === 0, "scratch work runs under private umask")
@@ -218,6 +222,25 @@ ok(pc[2].indexOf("-le " + M.thumbPngByteCeiling) !== -1, "producer-side png byte
 ok(pc[2].indexOf("printf '\\t-3\\t\\n'") !== -1, "oversize marker present")
 ok(pc[2].indexOf("printf '\\t-1\\t\\n'") !== -1, "unreadable marker present")
 ok(pc[2].indexOf("rm -rf -- \"$tmpd\";") !== -1, "private scratch dir cleaned up")
+eq(M.buildPdfPreviewCommand("/my pdf.pdf", "/tmp/base", undefined, undefined, 800)[2], pc[2],
+  "legacy two-arg call still accepted (persistence off)")
+
+// Persistent store: hit fast path, staleness-keyed name, atomic save, GC.
+var pcs = M.buildPdfPreviewCommand("/my pdf.pdf", "/tmp/base", "/store/pdf", 500, 800)
+ok(pcs[2].indexOf("md5sum | cut -d' ' -f1") !== -1, "disk key hashed with md5sum")
+ok(pcs[2].indexOf("stat -Lc %Y") !== -1, "source mtime feeds the disk key")
+ok(pcs[2].indexOf("printf '%s|%s|%s\\n' '/my pdf.pdf' \"${sz:-?}\" \"${mt:-?}\"") !== -1,
+  "disk key hashes raw path text with size and mtime")
+ok(pcs[2].indexOf("{ [ -d \"$store\" ] || mkdir -p -- \"$store\"; } 2>/dev/null && thumb=\"$store/$key.png\"") !== -1,
+  "store dir created on demand, failure degrades to render-only")
+ok(pcs[2].indexOf('base64 -w0 -- "$thumb"; exit 0') !== -1,
+  "hit streams stored pixels and exits before any renderer or scratch dir")
+ok(pcs[2].indexOf("\"$thumb.part\" && mv -f -- \"$thumb.part\" \"$thumb\"") !== -1,
+  "save publishes atomically via same-directory rename")
+ok(pcs[2].indexOf("tail -n +501") !== -1, "GC prunes beyond the configured cap")
+ok(pcs[2].indexOf("-le " + M.thumbPngByteCeiling) !== -1, "ceiling still enforced when persisting")
+ok(pcs[2].indexOf("if [ -n \"$thumb\" ]; then") !== -1,
+  "save and GC skipped entirely when the store is unavailable")
 
 // ================= misc regressions =================
 
@@ -336,7 +359,7 @@ ok(M.liveFdCommand(liveCfg, parse("--size +5mb"), 50)[2].indexOf("'.' \"${__p[@]
 
 // ================= video thumbnail command =================
 
-var vt = M.buildVideoThumbnailCommand("/v/clip.mp4", "/tmp/thumbbase", 1200)[2]
+var vt = M.buildVideoThumbnailCommand("/v/clip.mp4", "/tmp/thumbbase", "/store/video", 300, 1200)[2]
 ok(vt.indexOf("ffmpeg") !== -1, "video cmd uses ffmpeg")
 ok(vt.indexOf("-frames:v 1") !== -1, "grabs exactly one frame")
 ok(/-ss 1 /.test(vt) && /-ss 0 /.test(vt), "seeks 1s, falls back to 0s for short clips")
@@ -348,8 +371,9 @@ ok(vt.indexOf("mktemp -d -- '/tmp/thumbbase'.XXXXXX") !== -1, "per-job private s
 ok(vt.indexOf("-le " + M.thumbPngByteCeiling) !== -1 && vt.indexOf("printf '\\t-3\\t\\n'") !== -1,
   "producer-side png byte ceiling enforced")
 ok(vt.indexOf('rm -rf -- "$tmpd"') !== -1, "private scratch dir always cleaned")
-eq(M.buildVideoThumbnailCommand("/v/clip.mp4", "/tmp/thumbbase")[2].indexOf("1200") !== -1,
-  true, "render scale defaults")
+eq(M.buildVideoThumbnailCommand("/v/clip.mp4", "/tmp/thumbbase", "", 0)[2].indexOf("1200") !== -1,
+  true, "render scale defaults (persistence disabled)")
+ok(vt.indexOf("tail -n +301") !== -1, "video store prunes at its own cap")
 
 // ================= integration: real execution =================
 // Executes generated scripts against a throwaway tree to prove the bash
@@ -451,8 +475,10 @@ eq(M.buildVideoThumbnailCommand("/v/clip.mp4", "/tmp/thumbbase")[2].indexOf("120
 
 // PDF preview integration: renders a hand-written minimal PDF through the
 // real pdftoppm pipeline and proves the payload arrives as a decodable PNG
-// data url with no scratch file left behind. Skips silently when poppler is
-// not installed.
+// data url with no scratch file left behind. Also exercises the persistent
+// thumbnail store: save, cache-hit fast path, staleness re-key, oversize
+// refusal never saving, GC pruning, and the opt-out. Skips silently when
+// poppler is not installed.
 ;(function integrationPdf() {
   var probe = cp.spawnSync("pdftoppm", ["-v"], { encoding: "utf8" })
   if (probe.error || probe.status !== 0) return
@@ -466,33 +492,75 @@ eq(M.buildVideoThumbnailCommand("/v/clip.mp4", "/tmp/thumbbase")[2].indexOf("120
     + "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]>>endobj\n"
     + "trailer<</Root 1 0 R/Size 4>>\n%%EOF\n")
 
-  var cmd = M.buildPdfPreviewCommand(pdf, path.join(tmp, "render"), 200)
+  function scratchLeft() {
+    return fs.readdirSync(tmp).filter(function (f) { return f.indexOf("render") === 0 }).length
+  }
+
+  var store = path.join(tmp, "store", "pdf")
+  var cmd = M.buildPdfPreviewCommand(pdf, path.join(tmp, "render"), store, 500, 200)
   var out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
   var parsed = M.parsePreviewOutput(out)
 
   ok(parsed.size > 0, "integration: pdf header reports a size")
   ok(M.pdfDataUrl(parsed.content).indexOf("data:image/png;base64,iVBOR") === 0,
     "integration: payload is a PNG data url")
-  eq(fs.readdirSync(tmp).length, 1, "integration: private scratch dir removed, only doc.pdf left")
+  eq(scratchLeft(), 0, "integration: private scratch dir removed after persisting render")
+  eq(fs.readdirSync(store).length, 1, "integration: successful render saved exactly one stored png")
+  var savedKey = fs.readdirSync(store)[0]
+  ok(/^[0-9a-f]{32}\.png$/.test(savedKey), "integration: stored name is an md5 key")
+
+  // Cache hit: with the ceiling absurdly low a fresh render would report -3;
+  // only the disk fast path can still report a real payload.
+  out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+  eq(M.parsePreviewOutput(out).size, parsed.size, "integration: second run hits the disk store")
+  cmd = M.buildPdfPreviewCommand(pdf, path.join(tmp, "render"), store, 500, 200, 64)
+  out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+  ok(M.parsePreviewOutput(out).size > 0, "integration: hit path bypasses renderer and ceiling entirely")
+
+  // Staleness: touching the source mtime must re-key and re-render.
+  var later = new Date(Date.now() + 10000)
+  fs.utimesSync(pdf, later, later)
+  cmd = M.buildPdfPreviewCommand(pdf, path.join(tmp, "render"), store, 500, 200)
+  out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+  ok(M.parsePreviewOutput(out).size > 0, "integration: edited source re-renders")
+  eq(fs.readdirSync(store).length, 2, "integration: edit produced a fresh key, old entry left for GC")
 
   // Oversize refusal: an absurdly low ceiling must produce the -3 marker,
-  // never a payload, and must still clean up the private scratch dir.
-  cmd = M.buildPdfPreviewCommand(pdf, path.join(tmp, "render"), 200, 64)
+  // never a payload, and must NOT touch the store.
+  var other = path.join(tmp, "other.pdf")
+  fs.copyFileSync(pdf, other)
+  cmd = M.buildPdfPreviewCommand(other, path.join(tmp, "render"), store, 500, 200, 64)
   out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
   eq(M.parsePreviewOutput(out).size, -3, "integration: over-ceiling render reports too-large")
-  eq(fs.readdirSync(tmp).length, 1, "integration: scratch dir removed even on refusal")
+  eq(scratchLeft(), 0, "integration: scratch dir removed even on refusal")
+  eq(fs.readdirSync(store).filter(function (f) { return f !== savedKey }).length, 1,
+    "integration: refused render is never persisted")
+
+  // GC: cap of 2 keeps only the two newest files (the fresh save plus one).
+  cmd = M.buildPdfPreviewCommand(other, path.join(tmp, "render"), store, 2, 200)
+  out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+  ok(M.parsePreviewOutput(out).size > 0, "integration: capped store still serves renders")
+  eq(fs.readdirSync(store).length, 2, "integration: GC pruned the store to the configured cap")
 
   // Unreadable path reports the -1 marker instead of a payload.
-  cmd = M.buildPdfPreviewCommand(path.join(tmp, "missing.pdf"), path.join(tmp, "render"), 200)
+  cmd = M.buildPdfPreviewCommand(path.join(tmp, "missing.pdf"), path.join(tmp, "render"), store, 500, 200)
   out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
   eq(M.parsePreviewOutput(out).size, -1, "integration: missing pdf reports unreadable")
+
+  // Opt-out (limit 0): legacy behavior, no disk writes anywhere.
+  var bareStore = path.join(tmp, "bare-store", "pdf")
+  cmd = M.buildPdfPreviewCommand(pdf, path.join(tmp, "render"), bareStore, 0, 200)
+  out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+  ok(M.parsePreviewOutput(out).size > 0, "integration: opt-out still renders")
+  eq(fs.existsSync(bareStore), false, "integration: opt-out creates no store directory")
 
   fs.rmSync(tmp, { recursive: true, force: true })
 })()
 
 // Video thumbnail integration: renders a synthetic clip through the real
 // ffmpeg pipeline and proves the payload arrives as a decodable PNG data url
-// with no scratch file left behind. Skips silently when ffmpeg is absent.
+// with no scratch file left behind, plus persistent-store save/hit/staleness.
+// Skips silently when ffmpeg is absent.
 ;(function integrationVideo() {
   var probe = cp.spawnSync("ffmpeg", ["-version"], { encoding: "utf8" })
   if (probe.error || probe.status !== 0) return
@@ -509,38 +577,64 @@ eq(M.buildVideoThumbnailCommand("/v/clip.mp4", "/tmp/thumbbase")[2].indexOf("120
   var tmp = fs.mkdtempSync(path.join(os.tmpdir(), "finder-video-"))
   var base = path.join(tmp, "thumb")
   var vid = path.join(tmp, "clip.mp4")
+  var store = path.join(tmp, "store", "video")
 
   if (!makeClip(vid, 3)) {
     fs.rmSync(tmp, { recursive: true, force: true })
     return
   }
-  var cmd = M.buildVideoThumbnailCommand(vid, base, 200)
+  var cmd = M.buildVideoThumbnailCommand(vid, base, store, 500, 200)
   var out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
   var parsed = M.parsePreviewOutput(out)
   ok(parsed.size > 0, "integration: video header reports a size")
   ok(M.pdfDataUrl(parsed.content).indexOf("data:image/png;base64,iVBOR") === 0,
     "integration: video payload is a PNG data url")
-  eq(fs.readdirSync(tmp).filter(function (f) { return f !== "clip.mp4" }).length, 0,
-    "integration: video scratch dir removed, only the clip left")
+  eq(fs.readdirSync(tmp).filter(function (f) { return f.indexOf("thumb") === 0 }).length, 0,
+    "integration: video scratch dir removed")
+  eq(fs.readdirSync(store).length, 1, "integration: extracted frame saved to the disk store")
+  var savedSize = parsed.size
 
-  // Oversize refusal with an absurdly low ceiling: -3 marker, still cleaned up.
-  cmd = M.buildVideoThumbnailCommand(vid, base, 200, 64)
+  // Disk hit: low ceiling would force -3 on a fresh extraction; only the
+  // store fast path can still return pixels.
   out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
-  eq(M.parsePreviewOutput(out).size, -3, "integration: over-ceiling frame reports too-large")
-  eq(fs.readdirSync(tmp).filter(function (f) { return f !== "clip.mp4" }).length, 0,
-    "integration: video scratch dir removed even on refusal")
+  eq(M.parsePreviewOutput(out).size, savedSize, "integration: second video look hits the disk store")
+  cmd = M.buildVideoThumbnailCommand(vid, base, store, 500, 200, 64)
+  out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+  ok(M.parsePreviewOutput(out).size > 0, "integration: video hit bypasses ffmpeg and ceiling entirely")
+
+  // Staleness: an mtime bump re-keys and re-extracts.
+  var later = new Date(Date.now() + 10000)
+  fs.utimesSync(vid, later, later)
+  cmd = M.buildVideoThumbnailCommand(vid, base, store, 500, 200)
+  out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+  ok(M.parsePreviewOutput(out).size > 0, "integration: re-touched clip re-extracts")
+  eq(fs.readdirSync(store).length, 2, "integration: edit produced a fresh video key")
+
+  // Oversize refusal: an absurdly low ceiling on a FRESH key must produce
+  // the -3 marker, clean up, and persist nothing.
+  var bigVid = path.join(tmp, "big.mp4")
+  if (makeClip(bigVid, 0.5)) {
+    cmd = M.buildVideoThumbnailCommand(bigVid, base, store, 500, 200, 64)
+    out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+    eq(M.parsePreviewOutput(out).size, -3, "integration: over-ceiling frame reports too-large")
+    eq(fs.readdirSync(tmp).filter(function (f) { return f.indexOf("thumb") === 0 }).length, 0,
+      "integration: video scratch dir removed even on refusal")
+    eq(fs.readdirSync(store).length, 2, "integration: refused frame persists nothing")
+  }
+
+  // Unreadable path reports the -1 marker instead of a payload.
+  cmd = M.buildVideoThumbnailCommand(path.join(tmp, "missing.mp4"), base, store, 500, 200)
+  out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+  eq(M.parsePreviewOutput(out).size, -1, "integration: missing video reports unreadable")
 
   // Sub-second clip exercises the -ss 1 -> -ss 0 retry.
   var shortVid = path.join(tmp, "short.mp4")
   if (makeClip(shortVid, 0.4)) {
-    cmd = M.buildVideoThumbnailCommand(shortVid, base, 200)
+    cmd = M.buildVideoThumbnailCommand(shortVid, base, store, 500, 200)
     out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
     ok(M.parsePreviewOutput(out).size > 0, "integration: sub-second clip still yields a frame")
+    ok(fs.readdirSync(store).length >= 3, "integration: retry path saves its frame too")
   }
-
-  cmd = M.buildVideoThumbnailCommand(path.join(tmp, "missing.mp4"), base, 200)
-  out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
-  eq(M.parsePreviewOutput(out).size, -1, "integration: missing video reports unreadable")
 
   fs.rmSync(tmp, { recursive: true, force: true })
 })()

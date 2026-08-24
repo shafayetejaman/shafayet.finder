@@ -13,6 +13,12 @@ var debounceMs = 40
 var fdDebounceMs = 1000
 var rescanIntervalMs = 60000
 var pdfRenderScale = 1200
+// Rendered thumbnails also land on disk under
+// ~/.cache/thumbnails/<plugin>/{pdf,video}/ keyed by md5("<path>|<size>|<mtime>"),
+// so a fresh shell session reuses pixels instead of re-running pdftoppm/ffmpeg.
+// This caps stored files per kind; the oldest are pruned after each save.
+// Zero or less disables the disk layer entirely (pure in-memory behavior).
+var thumbnailCacheLimit = 500
 // Rendered-thumbnail hardening: producers refuse to ship any PNG larger than
 // this many bytes — a crafted document/media file or an oversized render
 // scale could otherwise balloon into the StdioCollector and stay resident in
@@ -144,6 +150,9 @@ function resolveSettings(settings, home) {
     previewByteLimit: positiveInt(settings, "preview_byte_limit", previewByteLimit),
     previewCacheLimit: positiveInt(settings, "preview_cache_limit", previewCacheLimit),
     pdfCacheLimit: positiveInt(settings, "pdf_cache_limit", pdfCacheLimit),
+    // Files kept per kind in the persistent thumbnail store. Non-negative on
+    // purpose: 0 is the documented opt-out, so positiveInt would swallow it.
+    thumbnailCacheLimit: nonNegativeInt(settings, "thumbnail_cache_limit", thumbnailCacheLimit),
     // Clamped 1..3: one worker means strictly serial previews, and more than
     // three slots can never be fed (selected row + two prefetched neighbors).
     previewWorkers: Math.min(3, positiveInt(settings, "preview_workers", previewWorkers)),
@@ -727,6 +736,66 @@ function isVideoPath(path) {
   return /\.(mp4|mkv|webm|mov|avi|m4v|mpg|mpeg|wmv|flv|m2ts|ts|3gp|ogv)$/i.test(String(path || ""))
 }
 
+// Shared body for both thumbnail producers: identical wire format, producer
+// ceiling, scratch-dir hygiene, plus the persistent disk layer. Only
+// renderSnippet differs (pdftoppm vs ffmpeg). An empty storeDir or a
+// non-positive limit reproduces the legacy render-and-stream behavior with
+// zero disk traffic.
+//
+// Disk protocol: key = md5("<path>|<size>|<mtime>") so any edit of the source
+// lands in a fresh file and stale entries can never produce a false hit.
+// HIT: "<store>/<key>.png" exists -> stream its base64 and exit before any
+// scratch dir or renderer is touched. MISS: render into the private scratch
+// dir as always, and only a within-ceiling PNG is published atomically
+// (cp to .part + mv inside the same directory) before being streamed.
+// Oversized (-3) and failed (-1) renders are never saved, so retry semantics
+// are unchanged. After each save the store is pruned to the newest
+// <cacheLimit> files. A store that cannot be created degrades gracefully to
+// render-without-persist instead of masking a readable file as unreadable.
+function thumbnailShellBody(path, outBase, storeDir, cacheLimit, renderSnippet, ceiling) {
+  var quoted = shellQuote(path)
+  var quotedBase = shellQuote(outBase)
+  var keep = parseInt(cacheLimit, 10)
+  var head = "umask 077;"
+    + " if [ -f " + quoted + " ] && [ -r " + quoted + " ]; then"
+    + " sz=$(stat -Lc %s -- " + quoted + " 2>/dev/null);"
+  var mid = " tmp=\"$tmpd/page.png\";"
+    + " " + renderSnippet
+    + " if [ -s \"$tmp\" ]; then"
+    + " if [ \"$(stat -Lc %s -- \"$tmp\")\" -le " + ceiling + " ]; then"
+  var close = ' printf "\\t%s\\t\\n" "${sz:-?}";'
+    + " base64 -w0 \"$tmp\";"
+    + " else printf '\\t-3\\t\\n'; fi"
+    + " else printf '\\t-1\\t\\n'; fi;"
+    + " rm -rf -- \"$tmpd\";"
+    + " else printf '\\t-1\\t\\n'; fi"
+  if (!storeDir || !(keep > 0)) {
+    return head
+      + " tmpd=$(mktemp -d -- " + quotedBase + ".XXXXXX) || { printf '\\t-1\\t\\n'; exit 0; };"
+      + mid
+      + close
+  }
+  var gc = "ls -1t -- \"$store\" 2>/dev/null | tail -n +" + (keep + 1)
+    + " | while IFS= read -r f; do rm -f -- \"$store/$f\"; done"
+  return head
+    + " mt=$(stat -Lc %Y -- " + quoted + " 2>/dev/null);"
+    + " key=$(printf '%s|%s|%s\\n' " + quoted + " \"${sz:-?}\" \"${mt:-?}\" | md5sum | cut -d' ' -f1);"
+    + " store=" + shellQuote(storeDir) + ";"
+    + " thumb=\"\";"
+    + " { [ -d \"$store\" ] || mkdir -p -- \"$store\"; } 2>/dev/null && thumb=\"$store/$key.png\";"
+    // Hit: pixels ship straight off disk — no renderer, no scratch dir.
+    + " if [ -n \"$thumb\" ] && [ -s \"$thumb\" ]; then"
+    + ' printf "\\t%s\\t\\n" "${sz:-?}";'
+    + " base64 -w0 -- \"$thumb\"; exit 0; fi;"
+    + " tmpd=$(mktemp -d -- " + quotedBase + ".XXXXXX) || { printf '\\t-1\\t\\n'; exit 0; };"
+    + mid
+    + " if [ -n \"$thumb\" ]; then"
+    + " { cp -f -- \"$tmp\" \"$thumb.part\" && mv -f -- \"$thumb.part\" \"$thumb\"; } 2>/dev/null;"
+    + " " + gc + ";"
+    + " fi;"
+    + close
+}
+
 // Renders page 1 of a PDF into a per-job PRIVATE scratch directory
 // ("<base>.XXXXXX", mktemp -d's mode-0700 regardless of umask — so
 // overlapping or killed renders can never read each other's pixels and no
@@ -739,28 +808,15 @@ function isVideoPath(path) {
 // reports the -3 marker instead of flooding the collector, and a corrupt or
 // unreadable document reports size -1 rather than being cached as
 // successfully rendered. The scratch directory is removed even after failed
-// renders; only a SIGKILLed mid-render job could leak one.
-function buildPdfPreviewCommand(path, outBase, scale, ceiling) {
+// renders; only a SIGKILLed mid-render job could leak one. Successful
+// renders are additionally published to the persistent store (see
+// thumbnailShellBody) unless persistence is disabled.
+function buildPdfPreviewCommand(path, outBase, storeDir, cacheLimit, scale, ceiling) {
   if (scale === undefined) scale = pdfRenderScale
   if (!isFinite(ceiling) || ceiling <= 0) ceiling = thumbPngByteCeiling
-  var quoted = shellQuote(path)
-  return [
-    "bash", "-c",
-    "umask 077;"
-    + " if [ -f " + quoted + " ] && [ -r " + quoted + " ]; then"
-    + " sz=$(stat -Lc %s -- " + quoted + " 2>/dev/null);"
-    + " tmpd=$(mktemp -d -- " + shellQuote(outBase) + ".XXXXXX) || { printf '\\t-1\\t\\n'; exit 0; };"
-    + " tmp=\"$tmpd/page.png\";"
-    + " " + termRelay("pdftoppm -png -f 1 -singlefile -scale-to " + scale + " " + quoted + " \"${tmp%.png}\"") + ";"
-    + " if [ -s \"$tmp\" ]; then"
-    + " if [ \"$(stat -Lc %s -- \"$tmp\")\" -le " + ceiling + " ]; then"
-    + ' printf "\\t%s\\t\\n" "${sz:-?}";'
-    + " base64 -w0 \"$tmp\";"
-    + " else printf '\\t-3\\t\\n'; fi"
-    + " else printf '\\t-1\\t\\n'; fi;"
-    + " rm -rf -- \"$tmpd\";"
-    + " else printf '\\t-1\\t\\n'; fi"
-  ]
+  var render = termRelay("pdftoppm -png -f 1 -singlefile -scale-to " + scale
+    + " " + shellQuote(path) + " \"${tmp%.png}\"") + ";"
+  return ["bash", "-c", thumbnailShellBody(path, outBase, storeDir, cacheLimit, render, ceiling)]
 }
 
 // Wraps base64 PNG bytes into a self-contained <img> source. Whitespace must
@@ -777,41 +833,24 @@ function pdfDataUrl(b64) {
 // Grabs one representative frame of a video into a per-job PRIVATE scratch
 // directory ("<base>.XXXXXX", same mktemp -d scheme as PDF renders) and
 // reports "\t<size>\t" followed by the image as base64 text — identical wire
-// format and identical producer-side ceiling, so the payload lands in the
-// same bounded in-memory cache. Seeks 1s in for a representative frame;
-// videos shorter than that (or with no decodable frame at 1s) retry from 0s,
-// and only then report size -1; an over-ceiling frame reports size -3.
+// format, ceiling, persistent store and GC as the PDF producer (see
+// thumbnailShellBody). Seeks 1s in for a representative frame; videos
+// shorter than that (or with no decodable frame at 1s) retry from 0s, and
+// only then report size -1; an over-ceiling frame reports size -3.
 // ffmpeg is relay-wrapped to die on stale teardown, -nostdin keeps it from
 // ever eating a collector's stdin, and the scratch directory is removed even
 // after failed runs; only a SIGKILLed mid-extract job could leak one.
-function buildVideoThumbnailCommand(path, outBase, scale, ceiling) {
+function buildVideoThumbnailCommand(path, outBase, storeDir, cacheLimit, scale, ceiling) {
   if (scale === undefined) scale = pdfRenderScale
   if (!isFinite(ceiling) || ceiling <= 0) ceiling = thumbPngByteCeiling
-  var quoted = shellQuote(path)
   var grab = function (ss) {
     return termRelay("ffmpeg -nostdin -hide_banner -loglevel error -ss " + ss
-      + " -i " + quoted
+      + " -i " + shellQuote(path)
       + " -frames:v 1 -map v:0 -vf 'scale=min(iw\\," + scale + "):-2'"
       + " -y \"$tmp\"") + ";"
   }
-  return [
-    "bash", "-c",
-    "umask 077;"
-    + " if [ -f " + quoted + " ] && [ -r " + quoted + " ]; then"
-    + " sz=$(stat -Lc %s -- " + quoted + " 2>/dev/null);"
-    + " tmpd=$(mktemp -d -- " + shellQuote(outBase) + ".XXXXXX) || { printf '\\t-1\\t\\n'; exit 0; };"
-    + " tmp=\"$tmpd/page.png\";"
-    + grab(1)
-    + " if [ ! -s \"$tmp\" ]; then " + grab(0) + " fi;"
-    + " if [ -s \"$tmp\" ]; then"
-    + " if [ \"$(stat -Lc %s -- \"$tmp\")\" -le " + ceiling + " ]; then"
-    + ' printf "\\t%s\\t\\n" "${sz:-?}";'
-    + " base64 -w0 \"$tmp\";"
-    + " else printf '\\t-3\\t\\n'; fi"
-    + " else printf '\\t-1\\t\\n'; fi;"
-    + " rm -rf -- \"$tmpd\";"
-    + " else printf '\\t-1\\t\\n'; fi"
-  ]
+  return ["bash", "-c", thumbnailShellBody(path, outBase, storeDir, cacheLimit,
+    grab(1) + " if [ ! -s \"$tmp\" ]; then " + grab(0) + " fi;", ceiling)]
 }
 
 function formatBytes(bytes) {
@@ -835,6 +874,7 @@ if (typeof module !== "undefined") {
     previewByteLimit: previewByteLimit,
     previewCacheLimit: previewCacheLimit,
     pdfCacheLimit: pdfCacheLimit,
+    thumbnailCacheLimit: thumbnailCacheLimit,
     previewWorkers: previewWorkers,
     debounceMs: debounceMs,
     rescanIntervalMs: rescanIntervalMs,

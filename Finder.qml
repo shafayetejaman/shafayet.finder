@@ -45,13 +45,21 @@ Item {
   // Scratch template for pdftoppm/ffmpeg jobs: each job mktemp -d's its own
   // private mode-0700 directory ("<base>.XXXXXX"), renders inside it, and
   // removes the directory afterwards, so concurrent or killed renders can
-  // never overwrite each other and nothing persists on disk.
+  // never overwrite each other. The scratch itself never persists — the
+  // pixels do, in thumbStoreBase below.
   readonly property string pdfPngBase: home + "/.local/state/omarchy/file-finder-pdf"
+  // Persistent thumbnail store: rendered PDF pages and video frames survive
+  // shell restarts here, keyed by md5("<path>|<size>|<mtime>") so an edited
+  // source can never produce a stale hit. Honors XDG_CACHE_HOME; the plugin
+  // subdirectory keeps us clear of freedesktop-spec directories other apps
+  // own and garbage-collect by their own rules.
+  readonly property string thumbStoreBase: (Quickshell.env("XDG_CACHE_HOME") || home + "/.cache") + "/thumbnails/" + pluginId
   // path → { url }, url being a self-contained data:image/png;base64 payload
   // held in memory (rendered PDF pages AND extracted video frames). Storing
   // bytes instead of pointing at a shared render file means an entry can
   // never go stale under us — switching items overwrites nothing, so
-  // arrowing around always shows each one's own thumbnail.
+  // arrowing around always shows each one's own thumbnail. The first look of
+  // a session is served from thumbStoreBase instead of re-rendering.
   readonly property int pdfCacheLimit: root.cfg.pdfCacheLimit
   property var pdfCache: ({})
   property var pdfCacheKeys: []
@@ -110,8 +118,9 @@ Item {
     root.disarmPointer()
     root.clearPreview()
     // The preview caches persist across toggles for the whole shell session,
-    // so revisiting a file re-shows its preview instantly — PDF thumbnails
-    // included, since their entries are self-contained data URLs.
+    // so revisiting a file re-shows its preview instantly. Thumbnails go one
+    // better: they persist across shell restarts on disk (thumbStoreBase),
+    // so even the first look of a session skips pdftoppm/ffmpeg entirely.
     root.rebuildDisplay(true)
     root.refreshScan()
     searchDebounce.restart()
@@ -600,7 +609,7 @@ Item {
         return
       }
       // Frame extraction is ffmpeg-heavy like PDF renders: not prefetched.
-      root.dispatchPreview("video", cleanVideo, marked, FinderModel.buildVideoThumbnailCommand(cleanVideo, root.pdfPngBase, root.cfg.pdfRenderScale))
+      root.dispatchPreview("video", cleanVideo, marked, FinderModel.buildVideoThumbnailCommand(cleanVideo, root.pdfPngBase, root.thumbStoreBase, root.cfg.thumbnailCacheLimit, root.cfg.pdfRenderScale))
       return
     }
 
@@ -639,7 +648,7 @@ Item {
         return
       }
       // PDF renders are heavy; not prefetched, so no neighbor pass here.
-      root.dispatchPreview("pdf", cleanPdf, marked, FinderModel.buildPdfPreviewCommand(cleanPdf, root.pdfPngBase, root.cfg.pdfRenderScale))
+      root.dispatchPreview("pdf", cleanPdf, marked, FinderModel.buildPdfPreviewCommand(cleanPdf, root.pdfPngBase, root.thumbStoreBase, root.cfg.thumbnailCacheLimit, root.cfg.pdfRenderScale))
       return
     }
 
