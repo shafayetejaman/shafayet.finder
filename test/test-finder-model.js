@@ -245,8 +245,11 @@ ok(pc[2].indexOf("mkdir -p -- '/tmp' 2>/dev/null; tmpd=$(mktemp -d -- '/tmp/base
 var pcs = M.buildPdfPreviewCommand("/my pdf.pdf", "/tmp/base", "/store/pdf", 500, 800)
 ok(pcs[2].indexOf("md5sum | cut -d' ' -f1") !== -1, "disk key hashed with md5sum")
 ok(pcs[2].indexOf("stat -Lc %Y") !== -1, "source mtime feeds the disk key")
-ok(pcs[2].indexOf("printf '%s|%s|%s\\n' '/my pdf.pdf' \"${sz:-?}\" \"${mt:-?}\"") !== -1,
-  "disk key hashes raw path text with size and mtime")
+ok(pcs[2].indexOf("stat -Lc %i") !== -1, "source inode feeds the disk key")
+ok(pcs[2].indexOf("printf '%s|%s|%s|%s\\n' '/my pdf.pdf' \"${sz:-?}\" \"${mt:-?}\" \"${in:-?}\"") !== -1,
+  "disk key hashes raw path text with size, mtime and inode")
+ok(pcs[2].indexOf("rm -f -- \"$thumb.part\"; { cp -f") !== -1,
+  "publish unlinks .part first so a planted symlink cannot redirect writes")
 ok(pcs[2].indexOf("{ [ -d \"$store\" ] || mkdir -p -- \"$store\"; } 2>/dev/null && thumb=\"$store/$key.png\"") !== -1,
   "store dir created on demand, failure degrades to render-only")
 ok(pcs[2].indexOf('base64 -w0 -- "$thumb"; exit 0') !== -1,
@@ -312,6 +315,17 @@ eq(parse("-S 5mb --type d report rest"), { args: ["-S", "5mb", "--type", "d"], f
 eq(parse("--changed-within 1d ."), { args: ["--changed-within", "1d"], fdPattern: ".", fzfQuery: "" },
   "match-all wildcard token")
 eq(parse("-"), { args: [], fdPattern: "-", fzfQuery: "" }, "lone dash is text, not a flag")
+
+// Execution flags never reach fd — they become literal search text.
+eq(parse("--exec rm"), { args: [], fdPattern: "--exec", fzfQuery: "rm" }, "--exec demoted to text")
+eq(parse("-x sh"), { args: [], fdPattern: "-x", fzfQuery: "sh" }, "-x demoted to text")
+eq(parse("--exec-batch ls ."), { args: [], fdPattern: "--exec-batch", fzfQuery: "ls ." }, "--exec-batch demoted to text")
+eq(parse("--exec=sh rm"), { args: [], fdPattern: "--exec=sh", fzfQuery: "rm" }, "attached exec form demoted too")
+eq(parse("--size +5mb --exec rm"), { args: ["--size", "+5mb"], fdPattern: "--exec", fzfQuery: "rm" },
+  "valid flags before an exec flag survive; exec onward goes literal")
+var liveCfgExec = M.resolveSettings({ search_dirs: ["/r1"] }, HOME)
+ok(M.liveFdCommand(liveCfgExec, parse("--exec rm"), 50)[2].indexOf("exec") === -1,
+  "live walk never contains exec flags")
 
 // ================= fdCacheKey / warm-edit path =================
 

@@ -122,7 +122,7 @@ stale runs are killed on every keystroke, so even aggressive values stay safe.
 | `preview_byte_limit`  | int      | `65536`           | Bytes of file content or directory listing loaded per preview.                                                                                                                                                                                                                                    |
 | `preview_cache_limit` | int      | `500`             | LRU entries kept in memory across opens (per shell session).                                                                                                                                                                                                                                      |
 | `pdf_cache_limit`     | int      | `12`              | Rendered thumbnails (PDF pages and video frames) kept in memory across opens (LRU). Thumbnails are held as self-contained images, so entries never go stale; raise only if you browse many large documents.                                                                                       |
-| `thumbnail_cache_limit` | int    | `500`             | Rendered thumbnails kept **on disk** per kind in `~/.cache/thumbnails/shafayet.finder/{pdf,video}/`, so a fresh shell session reuses pixels instead of re-running `pdftoppm`/`ffmpeg`. Entries are keyed by `<path|size|mtime>`, so an edited file never gets a stale hit; the oldest files are pruned after each save. Set to `0` to disable persistence entirely. |
+| `thumbnail_cache_limit` | int    | `500`             | Rendered thumbnails kept **on disk** per kind in `~/.cache/thumbnails/shafayet.finder/{pdf,video}/`, so a fresh shell session reuses pixels instead of re-running `pdftoppm`/`ffmpeg`. Entries are keyed by `<path|size|mtime|inode>`, so an edited or replaced file never gets a stale hit; the oldest files are pruned after each save. Set to `0` to disable persistence entirely. |
 | `preview_workers` | int | `3` | Concurrent preview processes; a slow PDF render never blocks text previews. Clamped to **1–3**: `1` means strictly serial previews, and more than 3 can never be used (selected row + two prefetched neighbors). |
 | `debounce_ms`         | int      | `40`              | Delay between keystroke/selection and its search/preview launch. Stale runs are killed by the next keystroke, so low values stay cheap — `25` feels near-instant.                                                                                                                                 |
 | `fd_debounce_ms`      | int      | `1000`            | Debounce for flag-mode queries (`--size +5mb …`). These walk real directory trees, so they wait for typing to settle before launching; every keystroke still kills the previous run eagerly.                                                                                                      |
@@ -207,6 +207,9 @@ Notes:
   `--absolute-path` is forced regardless of what you type.
 - Flag mode reads the live disk, so it works even while the index is still
   scanning. Previews come from the same cache as everywhere else.
+- Execution flags (`-x`/`--exec`, `-X`/`--exec-batch`) are never passed to
+  `fd`: typing them in the search box demotes them — and everything after
+  them — to literal search text, so the finder can never run commands.
 
 ## Behavior notes
 
@@ -232,14 +235,16 @@ Notes:
   afterwards.
 - Successful thumbnails also land on disk under
   `~/.cache/thumbnails/shafayet.finder/{pdf,video}/` (`XDG_CACHE_HOME`
-  honored), named by `md5("<path>|<size>|<mtime>")` so an edited source can
-  never produce a stale hit. The first preview of a session is then served
-  straight off disk — no `pdftoppm`/`ffmpeg` run at all. The store is capped
-  per kind by `thumbnail_cache_limit` (oldest pruned after each save); `0`
-  disables it and restores purely in-memory behavior. Oversized or failed
-  renders are never persisted, so retrying still works. The plugin keeps its
-  own subdirectory rather than writing freedesktop-spec entries other apps
-  garbage-collect.
+  honored), named by `md5("<path>|<size>|<mtime>|<inode>")` so an edited
+  source can never produce a stale hit. The first preview of a session is
+  then served straight off disk — no `pdftoppm`/`ffmpeg` run at all. The
+  store is capped per kind by `thumbnail_cache_limit` (oldest pruned after
+  each save); `0` disables it and restores purely in-memory behavior.
+  Oversized or failed renders are never persisted, so retrying still works.
+  The plugin keeps its own subdirectory rather than writing freedesktop-spec
+  entries other apps garbage-collect.
+- Warm flag-mode refiltering scores up to `max_scan_results` rows client-side
+  per keystroke — instant on typical trees; very large walks may add a few ms.
 - Video previews show a representative frame grabbed by `ffmpeg` (1s in,
   falling back to the first frame for shorter clips) using the same
   `pdf_render_scale` cap and thumbnail cache as PDFs. Without ffmpeg the

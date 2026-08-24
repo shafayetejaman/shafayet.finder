@@ -332,7 +332,6 @@ function termRelay(cmd) {
 // "@@DIRS@@" frames the file/dir chunks; absolute paths never start with "@",
 // so marker lines stay unambiguous against legacy cached indexes.
 var scanSectionMarker = "@@DIRS@@"
-var scanBlockMarker = "@@END@@"
 
 // One relay-wrapped fd walk over every live root. Head truncation severs the
 // line stream, and any prefix of it is a valid index.
@@ -408,6 +407,13 @@ var FD_FLAG_ALIASES = {
   "--ext": "--extension",
 }
 
+// fd flags that run commands instead of printing paths. The search box must
+// never execute anything, so these are treated as literal search text.
+var FD_EXEC_FLAGS = {
+  "-x": 1, "--exec": 1,
+  "-X": 1, "--exec-batch": 1,
+}
+
 function flagLike(token) {
   return token.length > 1 && token.charAt(0) === "-"
 }
@@ -418,6 +424,7 @@ function flagLike(token) {
 //   "--size=+5mb report paid" -> attached values work; "paid" goes to fzf
 //   "-e pdf ."                -> args [-e pdf], match-all pattern "."
 //   "-- -weird"               -> everything after "--" is literal text
+//   "-x rm"                   -> exec flags are literal text, never run
 function parseQuery(input) {
   var tokens = String(input || "").trim().split(/\s+/).filter(function (t) { return t })
   var args = []
@@ -444,6 +451,14 @@ function parseQuery(input) {
     var bare = token
     var eq = token.indexOf("=")
     if (eq !== -1) bare = token.substring(0, eq)
+    // Execution flags never reach fd: the rest of the query becomes literal
+    // text, exactly like an explicit "--" separator.
+    if (FD_EXEC_FLAGS.hasOwnProperty(bare)) {
+      parsingFlags = false
+      text.push(token)
+      i++
+      continue
+    }
     var canonical = FD_FLAG_ALIASES.hasOwnProperty(bare)
       ? FD_FLAG_ALIASES[bare] + (eq === -1 ? "" : token.substring(eq))
       : token
@@ -675,14 +690,14 @@ function isVideoPath(path) {
 }
 
 // Shared body for both thumbnail producers (PDF/video differ only in the
-// render snippet). Disk protocol: key = md5("<path>|<size>|<mtime>") so an
-// edited source can never produce a false hit. Hit streams the stored PNG
-// and exits before any renderer or scratch dir runs. Miss renders privately
-// and publishes atomically (.part + rename) only when within the byte
-// ceiling; oversized (-3) and failed (-1) results are never saved. After a
-// save the store is pruned to the newest <cacheLimit> files. An unavailable
-// store degrades to render-without-persist. Empty storeDir or limit <= 0
-// disables the disk layer entirely.
+// render snippet). Disk protocol: key = md5("<path>|<size>|<mtime>|<inode>")
+// so an edited or replaced source can never produce a false hit. Hit streams
+// the stored PNG and exits before any renderer or scratch dir runs. Miss
+// renders privately and publishes atomically (.part unlinked then renamed)
+// only when within the byte ceiling; oversized (-3) and failed (-1) results
+// are never saved. After a save the store is pruned to the newest
+// <cacheLimit> files. An unavailable store degrades to render-without-persist.
+// Empty storeDir or limit <= 0 disables the disk layer entirely.
 function thumbnailShellBody(path, outBase, storeDir, cacheLimit, renderSnippet, ceiling) {
   var quoted = shellQuote(path)
   var quotedBase = shellQuote(outBase)
@@ -712,7 +727,8 @@ function thumbnailShellBody(path, outBase, storeDir, cacheLimit, renderSnippet, 
     + " | while IFS= read -r f; do rm -f -- \"$store/$f\"; done"
   return head
     + " mt=$(stat -Lc %Y -- " + quoted + " 2>/dev/null);"
-    + " key=$(printf '%s|%s|%s\\n' " + quoted + " \"${sz:-?}\" \"${mt:-?}\" | md5sum | cut -d' ' -f1);"
+    + " in=$(stat -Lc %i -- " + quoted + " 2>/dev/null);"
+    + " key=$(printf '%s|%s|%s|%s\\n' " + quoted + " \"${sz:-?}\" \"${mt:-?}\" \"${in:-?}\" | md5sum | cut -d' ' -f1);"
     + " store=" + shellQuote(storeDir) + ";"
     + " thumb=\"\";"
     + " { [ -d \"$store\" ] || mkdir -p -- \"$store\"; } 2>/dev/null && thumb=\"$store/$key.png\";"
@@ -723,6 +739,7 @@ function thumbnailShellBody(path, outBase, storeDir, cacheLimit, renderSnippet, 
     + " tmpd=$(mktemp -d -- " + quotedBase + ".XXXXXX) || { printf '\\t-1\\t\\n'; exit 0; };"
     + mid
     + " if [ -n \"$thumb\" ]; then"
+    + " rm -f -- \"$thumb.part\";"
     + " { cp -f -- \"$tmp\" \"$thumb.part\" && mv -f -- \"$thumb.part\" \"$thumb\"; } 2>/dev/null;"
     + " " + gc + ";"
     + " fi;"
@@ -794,7 +811,6 @@ if (typeof module !== "undefined") {
     builtinIgnoreNames: builtinIgnoreNames,
     termRelay: termRelay,
     scanSectionMarker: scanSectionMarker,
-    scanBlockMarker: scanBlockMarker,
     setting: setting,
     positiveInt: positiveInt,
     nonNegativeInt: nonNegativeInt,
@@ -824,6 +840,7 @@ if (typeof module !== "undefined") {
     fdDebounceMs: fdDebounceMs,
     FD_VALUE_FLAGS: FD_VALUE_FLAGS,
     FD_FLAG_ALIASES: FD_FLAG_ALIASES,
+    FD_EXEC_FLAGS: FD_EXEC_FLAGS,
     parseQuery: parseQuery,
     liveFdCommand: liveFdCommand,
     fdCacheKey: fdCacheKey,

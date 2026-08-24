@@ -9,7 +9,6 @@ import "FinderModel.js" as FinderModel
 Item {
   id: root
 
-  property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   property var shell: null
   property var manifest: null
   property bool opened: false
@@ -74,7 +73,7 @@ Item {
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string pluginId: manifest && manifest.id ? String(manifest.id) : "shafayet.finder"
-  readonly property string stateBase: home + "/.local/state/omarchy"
+  readonly property string stateBase: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/omarchy"
   readonly property string listPath: root.stateBase + "/file-finder-list.txt"
   // Empty-query browser directory (~/Downloads default).
   readonly property string browseDir: root.cfg.browseDir
