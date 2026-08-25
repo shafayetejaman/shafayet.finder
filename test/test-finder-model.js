@@ -1,4 +1,4 @@
-// Bash-output contract tests for FinderModel.js — completely standalone.
+// Bash-output contract tests for the script/ modules — completely standalone.
 // Run with:  node test/test-finder-model.js
 // Exits non-zero on the first failure and prints what was expected.
 
@@ -8,7 +8,29 @@ var fs = require("fs")
 var os = require("os")
 var path = require("path")
 
-var M = require(path.join(__dirname, "..", "FinderModel.js"))
+var SCRIPTS = path.join(__dirname, "..", "script")
+
+// Loads a QML-style JS library under node: `.import "X.js" as Ns` lines
+// become plain requires, so one source runs in both engines unmodified.
+function loadScript(name) {
+  var src = fs.readFileSync(path.join(SCRIPTS, name), "utf8")
+  var transformed = src.replace(/^\.import "(.+)\.js" as (\w+)\s*$/gm,
+    "var $2 = require(\"./$1.js\");")
+  var mod = { exports: {} }
+  var req = function (p) { return loadScript(p) }
+  new Function("module", "exports", "require", transformed)(mod, mod.exports, req)
+  return mod.exports
+}
+
+// Merged namespace keeps every assertion speaking the old flat FinderModel API.
+var M = Object.assign({},
+  loadScript("Core.js"),
+  loadScript("Fuzzy.js"),
+  loadScript("FdQuery.js"),
+  loadScript("Walks.js"),
+  loadScript("Search.js"),
+  loadScript("Settings.js"),
+  loadScript("Preview.js"))
 
 var passed = 0
 function ok(cond, label) {
@@ -933,5 +955,17 @@ ok(vt.indexOf("grep -v '\\.part$'") !== -1,
 
   fs.rmSync(base, { recursive: true, force: true })
 })()
+
+// ================= preview failure freshness =================
+
+ok(M.previewFailureTtlMs > 0, "failure TTL is positive")
+ok(M.previewFailureLimit >= 1, "failure cache limit is at least one")
+ok(M.isFailureFresh(1000, 1000 + M.previewFailureTtlMs - 1, M.previewFailureTtlMs),
+  "failure stays fresh just under the TTL")
+ok(!M.isFailureFresh(1000, 1000 + M.previewFailureTtlMs, M.previewFailureTtlMs),
+  "failure expires exactly at the TTL")
+ok(!M.isFailureFresh(2000, 1000, M.previewFailureTtlMs), "clock skew in the past never blocks")
+ok(!M.isFailureFresh(0, 5000, M.previewFailureTtlMs), "zero timestamp never blocks")
+ok(!M.isFailureFresh(NaN, 5000, M.previewFailureTtlMs), "garbage timestamp never blocks")
 
 console.log("OK — " + passed + " assertions passed")

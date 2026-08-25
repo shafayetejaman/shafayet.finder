@@ -226,8 +226,19 @@ Notes:
 ## Files
 
 - `Finder.qml` — overlay UI, process lifecycle, preview worker pool
-- `FinderModel.js` — pure helpers: settings resolution, path display,
-  command builders (exercisable with `node`)
+- `script/` — purpose-split JS libraries (QML `.import` layering, node-testable):
+  - `Core.js` — quoting, setting primitives, path/type utilities
+  - `Fuzzy.js` — client-side scoring/filtering
+  - `FdQuery.js` — fd flag sanitizing and search-box query parsing
+  - `Walks.js` — root guarding, excludes, relays, scan/browse commands
+  - `Search.js` — fzf filter command, live flag-mode walks, run identity
+  - `Settings.js` — defaults and shell.json cfg resolution
+  - `Preview.js` — preview/thumbnail producers, failure memo constants
+- `ShortcutHelp.qml` — Ctrl+Shift+/ keyboard-shortcuts modal
+- `ResultRow.qml` — result-list row delegate
+- `PreviewPane.qml` — right-hand preview pane (text/image/thumbnail)
+- `FinderHeader.qml` — filter echo + entry-count/status bar
+- `EmptyState.qml` — no-results / scanning overlay
 
 ## License
 

@@ -4,7 +4,13 @@ import Quickshell.Wayland
 import QtQuick
 import qs.Commons
 import qs.Ui
-import "FinderModel.js" as FinderModel
+import "script/Core.js" as Core
+import "script/Fuzzy.js" as Fuzzy
+import "script/FdQuery.js" as FdQuery
+import "script/Walks.js" as Walks
+import "script/Search.js" as Search
+import "script/Settings.js" as Settings
+import "script/Preview.js" as Preview
 
 Item {
   id: root
@@ -57,6 +63,7 @@ Item {
   // Selected row's preview is known-broken (unreadable, over-ceiling,
   // undecodable): placeholder instead of stale pixels; reset per request.
   property bool previewUnavailable: false
+  property bool helpVisible: false
 
   // path -> { meta, content }; oldest-first keys for LRU eviction.
   readonly property int previewCacheLimit: root.cfg.previewCacheLimit
@@ -72,6 +79,11 @@ Item {
   readonly property int pdfCacheLimit: root.cfg.pdfCacheLimit
   property var pdfCache: ({})
   property var pdfCacheKeys: []
+  // path -> failed-at epoch ms; bounded LRU of recent render failures so a
+  // pathological producer is not relaunched on every selection.
+  readonly property int previewFailureTtlMs: Preview.previewFailureTtlMs
+  property var previewFailCache: ({})
+  property var previewFailKeys: []
   property string prewarmKey: ""
 
   property color background: Color.menu.background
@@ -109,9 +121,13 @@ Item {
     return {}
   }
 
-  readonly property var cfg: FinderModel.resolveSettings(pluginSettings, home)
+  readonly property var cfg: Settings.resolveSettings(pluginSettings, home)
 
-  onCfgChanged: root.ensurePool()
+  onCfgChanged: {
+    root.ensurePool()
+    root.previewFailCache = {}
+    root.previewFailKeys = []
+  }
 
   function open(payloadJson) {
     root.opened = true
@@ -134,6 +150,7 @@ Item {
   function close() {
     // The scan keeps running on purpose — its result feeds the persisted index.
     root.opened = false
+    root.helpVisible = false
     searchDebounce.stop()
     browseDebounce.stop()
     fdDebounce.stop()
@@ -173,7 +190,7 @@ Item {
   function startScan() {
     if (!root.scanQueued) return
     root.scanQueued = false
-    scanProc.command = FinderModel.scanCommand(root.cfg, root.stateBase)
+    scanProc.command = Walks.scanCommand(root.cfg, root.stateBase)
     scanProc.running = true
   }
 
@@ -181,7 +198,7 @@ Item {
     var text = String(raw || "")
     // A partially dead walk (unmounted HDD shrinking the index to $HOME-only)
     // is never persisted — staying empty beats shipping wrong results.
-    var ratio = String(scanStderr || "").match(new RegExp(FinderModel.scanRootsMarker + "(\\d+)/(\\d+)"))
+    var ratio = String(scanStderr || "").match(new RegExp(Walks.scanRootsMarker + "(\\d+)/(\\d+)"))
     var partial = !!ratio && parseInt(ratio[1], 10) < parseInt(ratio[2], 10)
     if (!text || partial) {
       // Keep the "scanning…" indicator up across retries: with no usable
@@ -200,7 +217,7 @@ Item {
     }
     root.scanRefusals = 0
     partialScanRetry.stop()
-    root.fileListCount = FinderModel.countPaths(text)
+    root.fileListCount = Core.countPaths(text)
     root.lastScanFinishedAt = Date.now()
     root.scanning = false
     // Rewriting megabytes of identical index every rescan is pure disk churn;
@@ -216,7 +233,7 @@ Item {
   // text is remembered as the on-disk baseline for the write-skip above.
   function loadCachedList(raw) {
     var text = String(raw || "")
-    root.fileListCount = FinderModel.countPaths(text)
+    root.fileListCount = Core.countPaths(text)
     root.lastIndexedText = text
   }
 
@@ -227,13 +244,13 @@ Item {
       var line = lines[i]
       if (line.length <= 1 || line.charAt(0) !== "/") continue
       var marked = line
-      var isDir = FinderModel.isDirPath(marked)
-      var key = isDir ? FinderModel.cleanPath(marked) : marked
+      var isDir = Core.isDirPath(marked)
+      var key = isDir ? Core.cleanPath(marked) : marked
       if (!key) return
       root.prewarmKey = key
       warmPreviewProc.command = isDir
-        ? FinderModel.buildDirPreviewCommand(key, root.cfg.previewByteLimit, root.cfg.showHidden)
-        : FinderModel.buildPreviewCommand(marked, root.cfg.previewByteLimit)
+        ? Preview.buildDirPreviewCommand(key, root.cfg.previewByteLimit, root.cfg.showHidden)
+        : Preview.buildPreviewCommand(marked, root.cfg.previewByteLimit)
       warmPreviewProc.running = true
       return
     }
@@ -244,12 +261,12 @@ Item {
   function storeWarmedPreview(raw) {
     var key = root.prewarmKey
     if (!key) return
-    var parsed = FinderModel.parsePreviewOutput(String(raw || ""))
+    var parsed = Preview.parsePreviewOutput(String(raw || ""))
     if (parsed.size === -1) return
     // Oversize renders stay uncached so selecting the file later reports
     // "Thumbnail too large" instead of serving an empty warmed entry.
     if (parsed.size === -3) return
-    var meta = parsed.size === -2 ? root.dirMeta(parsed.mtime) : FinderModel.formatBytes(parsed.size)
+    var meta = parsed.size === -2 ? root.dirMeta(parsed.mtime) : Core.formatBytes(parsed.size)
     root.storePreviewInCache(key, meta, parsed.content)
   }
 
@@ -266,7 +283,7 @@ Item {
     }
     root.browseSerial++
     browseProc.revision = root.browseSerial
-    browseProc.command = FinderModel.browseCommand(root.cfg)
+    browseProc.command = Walks.browseCommand(root.cfg)
     browseProc.running = true
   }
 
@@ -280,7 +297,7 @@ Item {
     }
 
     // Flag queries walk the roots live — the persisted index is irrelevant.
-    var parsed = FinderModel.parseQuery(query)
+    var parsed = FdQuery.parseQuery(query)
     if (parsed.args.length > 0) {
       if (!parsed.fdPattern) {
         root.searchResults = []
@@ -289,7 +306,7 @@ Item {
       }
       // Same completed walk (e.g. a background rescan landed mid-query):
       // refilter the baseline instantly instead of killing and re-walking.
-      var key = FinderModel.fdCacheKey(root.cfg, parsed)
+      var key = Search.fdCacheKey(root.cfg, parsed)
       if (key !== "" && key === root.lastFdKey) {
         refreshFlagDisplay()
         return
@@ -323,22 +340,22 @@ Item {
     if (!searchProc.queuedStart) return
     searchProc.queuedStart = false
     var query = root.filterText.trim()
-    if (!query || !root.opened || FinderModel.parseQuery(query).args.length > 0 || root.fileListCount === 0) return
+    if (!query || !root.opened || FdQuery.parseQuery(query).args.length > 0 || root.fileListCount === 0) return
     searchProc.revision = root.searchSerial
-    searchProc.command = FinderModel.buildSearchCommand(root.listPath, query, root.cfg.maxDisplayRows)
+    searchProc.command = Search.buildSearchCommand(root.listPath, query, root.cfg.maxDisplayRows)
     searchProc.running = true
   }
 
   function startFdSearch() {
     if (!fdProc.queuedStart) return
     fdProc.queuedStart = false
-    var parsed = FinderModel.parseQuery(root.filterText.trim())
+    var parsed = FdQuery.parseQuery(root.filterText.trim())
     if (!root.opened || parsed.args.length === 0 || !parsed.fdPattern) return
     // Only a finished run promotes pendingKey to lastFdKey, so typing during
     // the walk can never poison the warm path.
-    fdProc.pendingKey = FinderModel.fdCacheKey(root.cfg, parsed)
+    fdProc.pendingKey = Search.fdCacheKey(root.cfg, parsed)
     fdProc.revision = root.fdSerial
-    fdProc.command = FinderModel.liveFdCommand(root.cfg, parsed, root.cfg.maxScanResults)
+    fdProc.command = Search.liveFdCommand(root.cfg, parsed, root.cfg.maxScanResults)
     fdProc.running = true
   }
 
@@ -350,12 +367,12 @@ Item {
     displayModel.clear()
     for (var i = 0; i < rows.length; i++) {
       var marked = rows[i]
-      var isDir = FinderModel.isDirPath(marked)
-      var path = FinderModel.cleanPath(marked)
+      var isDir = Core.isDirPath(marked)
+      var path = Core.cleanPath(marked)
       displayModel.append({
         path: marked,
-        name: FinderModel.fileName(path) + (isDir ? "/" : ""),
-        dir: FinderModel.dirName(path)
+        name: Core.fileName(path) + (isDir ? "/" : ""),
+        dir: Core.dirName(path)
       })
     }
 
@@ -399,7 +416,7 @@ Item {
   }
 
   function fdStagedText() {
-    var p = FinderModel.parseQuery(root.filterText.trim())
+    var p = FdQuery.parseQuery(root.filterText.trim())
     return (p.args.length > 0 && p.fdPattern) ? String(p.fzfQuery || "") : ""
   }
 
@@ -409,10 +426,10 @@ Item {
   function refreshFlagDisplay() {
     var staged = fdStagedText()
     var cache = root.fdWarmCache
-    var candidates = FinderModel.warmCandidates(cache ? cache.matches : null,
+    var candidates = Fuzzy.warmCandidates(cache ? cache.matches : null,
       cache ? cache.staged : "", staged, cache ? cache.complete : false)
     if (!candidates) candidates = root.fdBaseRows
-    var rows = FinderModel.fuzzyFilterRows(candidates, staged, root.fdWarmCacheCap)
+    var rows = Fuzzy.fuzzyFilterRows(candidates, staged, root.fdWarmCacheCap)
     // Uncapped-at-limit matches feed the next narrow keystroke; trashed rows
     // stay a display-only concern so the memo keeps describing the walk.
     var visible = []
@@ -433,7 +450,7 @@ Item {
     root.cancelPendingWork()
     searchDebounce.stop()
     fdDebounce.stop()
-    var parsed = FinderModel.parseQuery(nextFilter)
+    var parsed = FdQuery.parseQuery(nextFilter)
     if (parsed.args.length === 0 || !parsed.fdPattern) {
       root.lastFdKey = ""
       root.fdBaseRows = []
@@ -447,7 +464,7 @@ Item {
       }
       // Same walk as displayed: refilter the baseline in memory — instant in
       // both directions, no clearing.
-      var key = FinderModel.fdCacheKey(root.cfg, parsed)
+      var key = Search.fdCacheKey(root.cfg, parsed)
       if (key !== "" && key === root.lastFdKey) {
         refreshFlagDisplay()
         return
@@ -524,21 +541,21 @@ Item {
     var row = activeRow(index)
     if (!row) return
     root.close()
-    Util.execDetached("xdg-open " + Util.shellQuote(FinderModel.cleanPath(row.path)))
+    Util.execDetached("xdg-open " + Util.shellQuote(Core.cleanPath(row.path)))
   }
 
   function copyIndex(index) {
     var row = activeRow(index)
     if (!row) return
     root.close()
-    Util.execDetached('printf "%s" ' + Util.shellQuote(FinderModel.cleanPath(row.path)) + ' | wl-copy')
+    Util.execDetached('printf "%s" ' + Util.shellQuote(Core.cleanPath(row.path)) + ' | wl-copy')
   }
 
   function revealIndex(index) {
     var row = activeRow(index)
     if (!row) return
     root.close()
-    Util.execDetached("nautilus --select " + Util.shellQuote(FinderModel.cleanPath(row.path)))
+    Util.execDetached("nautilus --select " + Util.shellQuote(Core.cleanPath(row.path)))
   }
 
   function trashIndex(index) {
@@ -553,7 +570,7 @@ Item {
       root.previewContent = ""
       return
     }
-    Util.execDetached("trash-put " + Util.shellQuote(FinderModel.cleanPath(row.path)))
+    Util.execDetached("trash-put " + Util.shellQuote(Core.cleanPath(row.path)))
     root.trashedPaths[row.path] = true
     // Stay open: drop the trashed row and let the selection fall on the next
     // entry, so several files can be removed in one pass.
@@ -597,6 +614,19 @@ Item {
     root.storeLru(root.pdfCache, root.pdfCacheKeys, root.pdfCacheLimit, path, { url: url })
   }
 
+  function markPreviewFailed(path) {
+    if (!path) return
+    root.storeLru(root.previewFailCache, root.previewFailKeys,
+      Preview.previewFailureLimit, path, Date.now())
+  }
+
+  function recentlyFailedPreview(path) {
+    var at = root.previewFailCache[path]
+    if (!at || !Preview.isFailureFresh(at, Date.now(), root.previewFailureTtlMs)) return false
+    root.lruTouch(root.previewFailKeys, path)
+    return true
+  }
+
   // Generic LRU insert: evict oldest keys beyond the cap, then store.
   function storeLru(cache, keys, limit, path, value) {
     if (!cache[path]) {
@@ -629,36 +659,40 @@ Item {
   // or pool dispatch (workerKind + cachePath + command). Order matters — a
   // directory named *.pdf must classify as a directory.
   function previewLookup(marked) {
-    if (FinderModel.isVideoPath(marked)) {
-      var cleanVideo = FinderModel.cleanPath(marked)
+    if (Core.isVideoPath(marked)) {
+      var cleanVideo = Core.cleanPath(marked)
       var videoHit = root.cachedPdf(cleanVideo)
       if (videoHit) return { kind: "thumb", url: videoHit.url }
+      if (root.recentlyFailedPreview(cleanVideo)) return { kind: "fail" }
       return { kind: "worker", workerKind: "video", cachePath: cleanVideo,
-        command: FinderModel.buildVideoThumbnailCommand(cleanVideo, root.pdfPngBase,
+        command: Preview.buildVideoThumbnailCommand(cleanVideo, root.pdfPngBase,
           root.thumbStoreBase + "/video", root.cfg.thumbnailCacheLimit, root.cfg.pdfRenderScale) }
     }
-    if (FinderModel.isImagePath(marked)) {
+    if (Core.isImagePath(marked)) {
       return { kind: "image", url: Util.fileUrl(marked) }
     }
-    if (FinderModel.isDirPath(marked)) {
-      var cleanDir = FinderModel.cleanPath(marked)
+    if (Core.isDirPath(marked)) {
+      var cleanDir = Core.cleanPath(marked)
       var dirHit = root.cachedPreview(cleanDir)
       if (dirHit) return { kind: "text", isDir: true, meta: dirHit.meta, content: dirHit.content }
+      if (root.recentlyFailedPreview(cleanDir)) return { kind: "fail" }
       return { kind: "worker", workerKind: "dir", cachePath: cleanDir,
-        command: FinderModel.buildDirPreviewCommand(cleanDir, root.cfg.previewByteLimit, root.cfg.showHidden) }
+        command: Preview.buildDirPreviewCommand(cleanDir, root.cfg.previewByteLimit, root.cfg.showHidden) }
     }
-    if (FinderModel.isPdfPath(marked)) {
-      var cleanPdf = FinderModel.cleanPath(marked)
+    if (Core.isPdfPath(marked)) {
+      var cleanPdf = Core.cleanPath(marked)
       var pdfHit = root.cachedPdf(cleanPdf)
       if (pdfHit) return { kind: "thumb", url: pdfHit.url }
+      if (root.recentlyFailedPreview(cleanPdf)) return { kind: "fail" }
       return { kind: "worker", workerKind: "pdf", cachePath: cleanPdf,
-        command: FinderModel.buildPdfPreviewCommand(cleanPdf, root.pdfPngBase,
+        command: Preview.buildPdfPreviewCommand(cleanPdf, root.pdfPngBase,
           root.thumbStoreBase + "/pdf", root.cfg.thumbnailCacheLimit, root.cfg.pdfRenderScale) }
     }
     var fileHit = root.cachedPreview(marked)
     if (fileHit) return { kind: "text", isDir: false, meta: fileHit.meta, content: fileHit.content }
+    if (root.recentlyFailedPreview(marked)) return { kind: "fail" }
     return { kind: "worker", workerKind: "file", cachePath: marked,
-      command: FinderModel.buildPreviewCommand(marked, root.cfg.previewByteLimit) }
+      command: Preview.buildPreviewCommand(marked, root.cfg.previewByteLimit) }
   }
 
   // Paints a resolved preview, else hands it to the worker pool.
@@ -674,6 +708,11 @@ Item {
       root.previewContent = p.content
       // Empty directories preview fine; contentless files placeholder.
       root.previewUnavailable = !p.isDir && p.content === ""
+    } else if (p.kind === "fail") {
+      root.previewIsImage = false
+      root.previewMeta = ""
+      root.previewContent = ""
+      root.previewUnavailable = true
     } else {
       // Video/pdf renders keep the previous pane visible while working,
       // exactly like the original inline branches did.
@@ -685,11 +724,12 @@ Item {
 
   Component.onCompleted: {
     ensurePool()
+    chmodIndexProc.running = true
     // No startup scan here: listFile's load handlers pick between an
     // immediate first-run walk and the deferred startupScanTimer refresh.
     trashProbeProc.running = true
     warmRowProc.command = ["bash", "-c",
-      "( " + FinderModel.browseCommand(root.cfg)[2] + " ) 2>/dev/null | head -n 4"]
+      "( " + Walks.browseCommand(root.cfg)[2] + " ) 2>/dev/null | head -n 4"]
     warmRowProc.running = true
   }
 
@@ -707,6 +747,7 @@ Item {
     path: root.listPath
     atomicWrites: true
     printErrors: false
+    onSaved: chmodIndexProc.running = true
     onLoaded: {
       root.lastIndexFromDisk = true
       root.loadCachedList(text())
@@ -724,7 +765,7 @@ Item {
 
   Process {
     id: indexProbeProc
-    command: ["bash", "-c", "[ -f " + FinderModel.shellQuote(root.listPath) + " ]"]
+    command: ["bash", "-c", "[ -f " + Core.shellQuote(root.listPath) + " ]"]
     onExited: {
       if (exitCode === 0 || !root.lastIndexFromDisk) return
       // Deleted mid-session: restore the in-memory copy for fzf; the flag
@@ -732,6 +773,11 @@ Item {
       root.lastIndexFromDisk = false
       if (root.lastIndexedText) listFile.setText(root.lastIndexedText)
     }
+  }
+
+  Process {
+    id: chmodIndexProc
+    command: ["chmod", "600", root.listPath]
   }
 
   Process {
@@ -947,13 +993,13 @@ Item {
       var row = activeRow(idx)
       if (!row) continue
       var marked = row.path
-      if (FinderModel.isVideoPath(marked) || FinderModel.isImagePath(marked) || FinderModel.isPdfPath(marked)) continue
-      var isDir = FinderModel.isDirPath(marked)
-      var cachePath = isDir ? FinderModel.cleanPath(marked) : marked
+      if (Core.isVideoPath(marked) || Core.isImagePath(marked) || Core.isPdfPath(marked)) continue
+      var isDir = Core.isDirPath(marked)
+      var cachePath = isDir ? Core.cleanPath(marked) : marked
       if (root.cachedPreview(cachePath)) continue
       var command = isDir
-        ? FinderModel.buildDirPreviewCommand(cachePath, root.cfg.previewByteLimit, root.cfg.showHidden)
-        : FinderModel.buildPreviewCommand(marked, root.cfg.previewByteLimit)
+        ? Preview.buildDirPreviewCommand(cachePath, root.cfg.previewByteLimit, root.cfg.showHidden)
+        : Preview.buildPreviewCommand(marked, root.cfg.previewByteLimit)
       dispatchPreview("file", cachePath, "", command)
       if (!root.idlePreviewWorker()) return
     }
@@ -961,7 +1007,7 @@ Item {
 
   function finishPreview(worker, rawOutput) {
     if (!root.opened || worker.cancelled) return
-    var parsed = FinderModel.parsePreviewOutput(rawOutput)
+    var parsed = Preview.parsePreviewOutput(rawOutput)
     // No header at all means the producer itself died (killed worker,
     // vanished target): indistinguishable from an unreadable file.
     var deadProducer = parsed.size === 0 && parsed.mtime === "" && parsed.content === ""
@@ -970,6 +1016,7 @@ Item {
 
     if (worker.kind === "pdf" || worker.kind === "video") {
       if (parsed.size === -1 || deadProducer) {
+        root.markPreviewFailed(worker.currentPath)
         if (isSelected) {
           root.previewIsImage = false
           root.previewUnavailable = true
@@ -979,8 +1026,9 @@ Item {
         return
       }
       // Left uncached so lowering pdf_render_scale succeeds next time.
-      var url = FinderModel.pdfDataUrl(parsed.content)
+      var url = Preview.pdfDataUrl(parsed.content)
       if (parsed.size === -3 || url === "") {
+        root.markPreviewFailed(worker.currentPath)
         if (isSelected) {
           root.previewIsImage = false
           root.previewUnavailable = true
@@ -1009,7 +1057,9 @@ Item {
       return
     }
     if (parsed.size === -1 || deadProducer) {
-      // Uncached so a reappearance gets a fresh attempt.
+      // Uncached so a reappearance gets a fresh attempt; the failure memo
+      // bounds how often that attempt can burn a render.
+      root.markPreviewFailed(worker.currentPath)
       if (isSelected) {
         root.previewUnavailable = true
         root.previewMeta = "Unreadable file"
@@ -1020,10 +1070,10 @@ Item {
     var meta
     var content
     if (parsed.content.indexOf("\u0000") >= 0) {
-      meta = FinderModel.formatBytes(parsed.size) + " — binary file"
+      meta = Core.formatBytes(parsed.size) + " — binary file"
       content = ""
     } else {
-      meta = FinderModel.formatBytes(parsed.size)
+      meta = Core.formatBytes(parsed.size)
       if (parsed.mtime) meta += "  ·  " + parsed.mtime
       content = parsed.content
     }
@@ -1100,13 +1150,21 @@ Item {
 
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function(event) {
-          if (event.key === Qt.Key_Escape) {
+          if ((event.key === Qt.Key_Slash || event.key === Qt.Key_Question)
+              && (event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier)) {
+            root.helpVisible = !root.helpVisible
+            event.accepted = true
+          } else if (root.helpVisible) {
+            // Modal owns input: Escape dismisses, everything else is swallowed.
+            if (event.key === Qt.Key_Escape) root.helpVisible = false
+            event.accepted = true
+          } else if (event.key === Qt.Key_Escape) {
             if (root.filterText) root.setFilter("")
             else root.close()
             event.accepted = true
           } else if (event.key === Qt.Key_Backspace && (event.modifiers & Qt.ControlModifier)) {
             // Must run before Util.editsFilter or plain backspace eats Ctrl.
-            root.setFilter(FinderModel.deleteLastWord(root.filterText))
+            root.setFilter(Core.deleteLastWord(root.filterText))
             event.accepted = true
           } else if (Util.editsFilter(event, root.filterText)) {
             root.setFilter(Util.editedFilter(event, root.filterText))
@@ -1159,36 +1217,16 @@ Item {
         anchors.leftMargin: card.contentLeftInset
         spacing: root.contentSpacing
 
-        Rectangle {
+        FinderHeader {
+          filterText: root.filterText
+          scanning: root.scanning
+          entryCount: root.fileListCount
+          fontFamily: root.fontFamily
+          headingSize: root.cfg.contentHeading
+          captionSize: root.cfg.contentCaption
+          contentSize: root.contentFontSize
           width: parent.width
           height: root.headerHeight
-          radius: root.cornerRadius
-          color: "transparent"
-
-          Text {
-            anchors.left: parent.left
-            anchors.right: statusLabel.visible ? statusLabel.left : parent.right
-            anchors.rightMargin: statusLabel.visible ? Style.space(12) : 0
-            anchors.verticalCenter: parent.verticalCenter
-            text: root.filterText || "Search files…"
-            color: root.foreground
-            opacity: root.filterText ? 1 : 0.58
-            font.family: root.fontFamily
-            font.pixelSize: root.cfg.contentHeading
-            elide: Text.ElideRight
-          }
-
-          Text {
-            id: statusLabel
-            visible: !root.filterText && (root.scanning || root.fileListCount > 0)
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            text: root.scanning ? "scanning…" : root.fileListCount.toLocaleString() + " entries"
-            color: root.foreground
-            opacity: 0.5
-            font.family: root.fontFamily
-            font.pixelSize: root.cfg.contentCaption
-          }
         }
 
         Item {
@@ -1213,60 +1251,21 @@ Item {
                 spacing: Style.space(4)
                 boundsBehavior: Flickable.StopAtBounds
 
-                delegate: Rectangle {
-                  id: row
-                  required property int index
-                  required property string path
-                  required property string name
-                  required property string dir
+                delegate: ResultRow {
+                  hasCursor: root.cursorActive && index === root.selectedIndex
+                  home: root.home
+                  fontFamily: root.fontFamily
+                  nameSize: root.contentFontSize
+                  captionSize: root.cfg.contentCaption
+                  rowHeight: root.rowHeight
 
-                  readonly property bool hasCursor: root.cursorActive && index === root.selectedIndex
-
-                  width: ListView.view.width
-                  height: root.rowHeight
-                  radius: root.cornerRadius
-                  color: hasCursor ? root.selectedBackground : "transparent"
-
-                  Column {
-                    anchors.fill: parent
-                    anchors.leftMargin: Style.space(12)
-                    anchors.rightMargin: Style.space(12)
-                    anchors.topMargin: Style.space(8)
-                    anchors.bottomMargin: Style.space(8)
-                    spacing: 0
-
-                    Text {
-                      width: parent.width
-                      text: parent.parent.name
-                      color: parent.parent.hasCursor ? root.selectedText : root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: root.contentFontSize
-                      elide: Text.ElideRight
-                    }
-
-                    Text {
-                      width: parent.width
-                      text: FinderModel.shortenPath(parent.parent.dir, root.home)
-                      color: parent.parent.hasCursor ? root.selectedText : root.foreground
-                      opacity: 0.55
-                      font.family: root.fontFamily
-font.pixelSize: root.cfg.contentCaption
-                      elide: Text.ElideMiddle
-                    }
+                  onHoverMoved: function(idx, item, mouse) {
+                    root.selectFromPointer(idx, item, mouse)
                   }
-
-                  MouseArea {
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onPositionChanged: function(mouse) {
-                      root.selectFromPointer(row.index, row, mouse)
-                    }
-                    onClicked: {
-                      root.cursorActive = true
-                      root.selectedIndex = row.index
-                      root.activateIndex(row.index)
-                    }
+                  onActivated: function(idx) {
+                    root.cursorActive = true
+                    root.selectedIndex = idx
+                    root.activateIndex(idx)
                   }
                 }
               }
@@ -1275,124 +1274,45 @@ font.pixelSize: root.cfg.contentCaption
             Item {
               width: parent.width / 2
               height: parent.height
-              clip: true
 
-              Rectangle {
-                anchors.left: parent.left
-                anchors.top: parent.top
-                anchors.bottom: parent.bottom
-                width: Style.normalBorderWidth
-                color: Util.alpha(root.border, 0.28)
-              }
-
-              Text {
-                id: previewMetaLabel
-                visible: root.previewMeta.length > 0
-                anchors.top: parent.top
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.leftMargin: root.contentMargin
-                anchors.topMargin: 0
-                text: root.previewMeta
-                color: root.foreground
-                opacity: 0.55
-                font.family: root.fontFamily
-                font.pixelSize: root.cfg.contentCaption
-                elide: Text.ElideRight
-              }
-
-              Text {
-                visible: !root.previewIsImage
-                anchors.top: parent.top
-                anchors.left: parent.left
-                anchors.bottom: parent.bottom
-                anchors.right: parent.right
-                anchors.leftMargin: root.contentMargin
-                anchors.topMargin: root.previewMeta.length > 0 ? Style.space(22) : 0
-                text: root.previewContent
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: root.contentFontSize
-                wrapMode: Text.WrapAnywhere
-                elide: Text.ElideRight
-                verticalAlignment: Text.AlignTop
-              }
-
-              Image {
-                id: previewImage
-                visible: root.previewIsImage && status !== Image.Error
+              PreviewPane {
                 anchors.fill: parent
-                anchors.leftMargin: root.contentMargin
-                anchors.topMargin: 0
+                isImage: root.previewIsImage
                 source: root.previewSource
-                fillMode: Image.PreserveAspectFit
-                verticalAlignment: Image.AlignTop
-                asynchronous: true
-                smooth: true
-                onStatusChanged: {
-                  if (root.previewSource === "") return
-                  // Any undecodable image must surface the placeholder: Error
-                  // alone misses Null, which would leave a silent blank pane.
-                  if (status === Image.Error || status === Image.Null) root.previewUnavailable = true
-                }
-              }
-
-              Column {
-                anchors.centerIn: parent
-                spacing: Style.space(8)
-                visible: root.previewUnavailable
-
-                Text {
-                  text: "󰷑"
-                  color: root.selectedText
-                  opacity: 0.8
-                  font.family: root.fontFamily
-                  font.pixelSize: root.cfg.contentDisplayLarge
-                  horizontalAlignment: Text.AlignHCenter
-                  width: parent.width
-                }
-
-                Text {
-                  text: "Unable to preview"
-                  color: root.foreground
-                  opacity: 0.7
-                  font.family: root.fontFamily
-                  font.pixelSize: root.contentFontSize
-                  horizontalAlignment: Text.AlignHCenter
-                  width: parent.width
-                }
+                meta: root.previewMeta
+                content: root.previewContent
+                unavailable: root.previewUnavailable
+                fontFamily: root.fontFamily
+                captionSize: root.cfg.contentCaption
+                contentSize: root.contentFontSize
+                displayLargeSize: root.cfg.contentDisplayLarge
+                leftPad: root.contentMargin
+                onImageFailed: root.previewUnavailable = true
               }
             }
           }
 
-          Column {
-            anchors.centerIn: parent
-            spacing: Style.space(8)
+          EmptyState {
             visible: displayModel.count === 0
-
-            Text {
-              text: "󰍉"
-              color: root.selectedText
-              opacity: 0.8
-              font.family: root.fontFamily
-              font.pixelSize: root.cfg.contentDisplayLarge
-              horizontalAlignment: Text.AlignHCenter
-              width: parent.width
-            }
-
-            Text {
-              text: root.scanning && root.fileListCount === 0
-                ? "Scanning files…"
-                : (!root.filterText.trim() ? FinderModel.shortenPath(root.browseDir, root.home) + " is empty" : "No matches for “" + root.filterText + "”")
-              color: root.foreground
-              opacity: 0.7
-              font.family: root.fontFamily
-              font.pixelSize: root.contentFontSize
-              horizontalAlignment: Text.AlignHCenter
-              width: parent.width
-            }
+            anchors.centerIn: parent
+            scanning: root.scanning
+            entryCount: root.fileListCount
+            filterText: root.filterText
+            locationLabel: Core.shortenPath(root.browseDir, root.home)
+            fontFamily: root.fontFamily
+            contentSize: root.contentFontSize
+            displayLargeSize: root.cfg.contentDisplayLarge
           }
         }
+      }
+
+      ShortcutHelp {
+        visible: root.helpVisible
+        anchors.fill: parent
+        fontFamily: root.fontFamily
+        captionSize: root.cfg.contentCaption
+        headingSize: root.cfg.contentHeading
+        onCloseRequested: root.helpVisible = false
       }
     }
   }
