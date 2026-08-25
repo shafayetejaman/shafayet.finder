@@ -66,6 +66,8 @@ Item {
     visible: paneRoot.isImage && status !== Image.Error
     anchors.fill: parent
     anchors.leftMargin: paneRoot.leftPad
+    // Clear the meta line so captions never sit on top of pixels.
+    anchors.topMargin: paneRoot.meta.length > 0 ? Style.space(22) : 0
     source: paneRoot.source
     fillMode: Image.PreserveAspectFit
     verticalAlignment: Image.AlignTop

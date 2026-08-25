@@ -96,7 +96,7 @@ Item {
           width: Math.min(implicitWidth, parent.width - Style.space(120))
           text: row.modelData.keys
           textFormat: Text.PlainText
-          color: Color.menu.selectedBackground
+          color: Color.menu.text
           font.family: helpRoot.fontFamily
           font.pixelSize: helpRoot.captionSize
           elide: Text.ElideRight
@@ -105,13 +105,13 @@ Item {
         Text {
           id: actionLabel
           anchors.left: keyLabel.right
-          anchors.leftMargin: Style.space(16)
+          anchors.leftMargin: Style.space(28)
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
           text: row.modelData.action
           textFormat: Text.PlainText
           color: Color.menu.text
-          opacity: 0.62
+          opacity: 0.8
           font.family: helpRoot.fontFamily
           font.pixelSize: helpRoot.captionSize
           elide: Text.ElideRight
@@ -130,7 +130,7 @@ Item {
       text: "Ctrl+Shift+/ closes"
       textFormat: Text.PlainText
       color: Color.menu.text
-      opacity: 0.5
+      opacity: 0.8
       font.family: helpRoot.fontFamily
       font.pixelSize: helpRoot.captionSize
     }

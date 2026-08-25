@@ -5,7 +5,10 @@
 .import "Core.js" as Core
 .import "Walks.js" as Walks
 
-var pdfRenderScale = 1200
+// -scale-to for page thumbnails; sized so an A4 page costs roughly the same
+// pixels as a 1200-wide video frame (~0.9MP) — rasterization dominates cold
+// render time, so this is the main speed knob.
+var pdfRenderScale = 800
 // Hard cap for one pdftoppm/ffmpeg render; a hung producer must surface as an
 // honest -1 failure instead of an eternal blank pane.
 var renderTimeoutSecs = 45
@@ -94,11 +97,12 @@ function thumbnailShellBody(path, outBase, storeDir, cacheLimit, renderSnippet, 
   var head = "umask 077;"
     + " if [ -f " + quoted + " ] && [ -r " + quoted + " ]; then"
     + " sz=$(stat -Lc %s -- " + quoted + " 2>/dev/null);"
+    + " mt=$(stat -Lc %y -- " + quoted + " 2>/dev/null | cut -d. -f1);"
   var mid = " tmp=\"$tmpd/page.png\";"
     + " " + renderSnippet
     + " if [ -s \"$tmp\" ] && " + pngCompleteTest('"$tmp"') + "; then"
     + " if [ \"$(stat -Lc %s -- \"$tmp\")\" -le " + ceiling + " ]; then"
-  var close = ' printf "\\t%s\\t\\n" "${sz:-?}";'
+  var close = ' printf "\\t%s\\t%s\\n" "${sz:-?}" "$mt";'
     + " base64 -w0 \"$tmp\";"
     + " else printf '\\t-3\\t\\n'; fi"
     + " else printf '\\t-1\\t\\n'; fi;"
@@ -117,15 +121,15 @@ function thumbnailShellBody(path, outBase, storeDir, cacheLimit, renderSnippet, 
     + " | tail -n +" + (keep + 1)
     + " | while IFS= read -r f; do rm -f -- \"$store/$f\"; done"
   return head
-    + " mt=$(stat -Lc %Y -- " + quoted + " 2>/dev/null);"
+    + " kmt=$(stat -Lc %Y -- " + quoted + " 2>/dev/null);"
     + " in=$(stat -Lc %i -- " + quoted + " 2>/dev/null);"
-    + " key=$(printf '%s|%s|%s|%s\\n' " + quoted + " \"${sz:-?}\" \"${mt:-?}\" \"${in:-?}\" | md5sum | cut -d' ' -f1);"
+    + " key=$(printf '%s|%s|%s|%s\\n' " + quoted + " \"${sz:-?}\" \"${kmt:-?}\" \"${in:-?}\" | md5sum | cut -d' ' -f1);"
     + " store=" + Core.shellQuote(storeDir) + ";"
     + " thumb=\"\";"
     + " { [ -d \"$store\" ] || mkdir -p -- \"$store\"; } 2>/dev/null && thumb=\"$store/$key.png\";"
     + " if [ -n \"$thumb\" ] && [ -s \"$thumb\" ]; then"
     + " if " + pngCompleteTest('"$thumb"') + "; then"
-    + ' printf "\\t%s\\t\\n" "${sz:-?}";'
+    + ' printf "\\t%s\\t%s\\n" "${sz:-?}" "$mt";'
     + " base64 -w0 -- \"$thumb\"; exit 0; fi;"
     + " rm -f -- \"$thumb\"; fi;"
     + " " + scratchPre
@@ -156,6 +160,27 @@ function pdfDataUrl(b64) {
   var s = String(b64 || "").replace(/\s+/g, "")
   if (s.length === 0 || s.length > Math.ceil(thumbPngByteCeiling / 3) * 4) return ""
   return "data:image/png;base64," + s
+}
+
+// True when probed bytes mark the file as binary: one NUL anywhere in the
+// sampled head (ID3 padding, ELF headers, UTF-16 …). Text never contains it.
+function isBinaryContent(content) {
+  return String(content || "").indexOf("\u0000") >= 0
+}
+
+// Caption-only probe: "\t<size>\t<mtime>\n" with no content. Lets image
+// previews paint instantly from a file URL while a cheap pool job fills
+// their size·date line afterwards.
+function buildStatCommand(path) {
+  var quoted = Core.shellQuote(path)
+  return [
+    "bash", "-c",
+    "if [ -f " + quoted + " ] && [ -r " + quoted + " ]; then"
+    + " sz=$(stat -Lc %s -- " + quoted + " 2>/dev/null);"
+    + " mt=$(stat -Lc %y -- " + quoted + " 2>/dev/null | cut -d. -f1);"
+    + ' printf "\\t%s\\t%s\\n" "${sz:-?}" "$mt";'
+    + " else printf '\\t-1\\t\\n'; fi"
+  ]
 }
 
 // Same wire/store/GC as the PDF producer; seeks 1s in, retries from 0s when
@@ -189,6 +214,8 @@ if (typeof module !== "undefined") {
     parsePreviewOutput: parsePreviewOutput,
     buildPdfPreviewCommand: buildPdfPreviewCommand,
     buildVideoThumbnailCommand: buildVideoThumbnailCommand,
+    buildStatCommand: buildStatCommand,
+    isBinaryContent: isBinaryContent,
     pdfDataUrl: pdfDataUrl
   }
 }

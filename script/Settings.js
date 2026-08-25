@@ -10,6 +10,8 @@ var maxBrowseRows = 200
 var previewByteLimit = 65536
 var previewCacheLimit = 500
 var pdfCacheLimit = 12
+// -scale-to for page thumbnails; also caps video frame width.
+var pdfRenderScale = 800
 var previewWorkers = 3
 var debounceMs = 40
 var fdDebounceMs = 1000
@@ -94,7 +96,7 @@ function resolveSettings(settings, home) {
     debounceMs: Core.nonNegativeInt(settings, "debounce_ms", debounceMs),
     fdDebounceMs: Core.nonNegativeInt(settings, "fd_debounce_ms", fdDebounceMs),
     rescanIntervalMs: Core.nonNegativeInt(settings, "rescan_interval_ms", rescanIntervalMs),
-    pdfRenderScale: Math.min(4000, Math.max(64, Core.positiveInt(settings, "pdf_render_scale", 1200))),
+    pdfRenderScale: Math.min(4000, Math.max(64, Core.positiveInt(settings, "pdf_render_scale", pdfRenderScale))),
     showHidden: Core.boolSetting(settings, "show_hidden", false),
     contentFontSize: Core.positiveInt(settings, "content_font_size", fontTitle),
     contentCaption: Core.positiveInt(settings, "content_caption", fontCaption),

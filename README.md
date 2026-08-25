@@ -79,7 +79,7 @@ with this plugin's `id` to the `plugins` array in
       "debounce_ms": 25,
       "fd_debounce_ms": 1000,
       "rescan_interval_ms": 300000,
-      "pdf_render_scale": 1200,
+      "pdf_render_scale": 800,
       "show_hidden": false,
       "fd_flags": ["--ignore-vcs", "--follow"],
     },
@@ -124,7 +124,7 @@ aggressive values stay safe.
 | `debounce_ms`           | `int`      | `40`              | Delay from keystroke/selection to its search/preview launch.                       |
 | `fd_debounce_ms`        | `int`      | `1000`            | Debounce for flag-mode queries, which walk real directory trees.                   |
 | `rescan_interval_ms`    | `int`      | `60000`           | Minimum time between full rescans; `0` rescans on every open.                      |
-| `pdf_render_scale`      | `int`      | `1200`            | `-scale-to` for page thumbnails; also caps video frame width. Clamped `64`–`4000`. |
+| `pdf_render_scale`      | `int`      | `800`             | `-scale-to` for page thumbnails; also caps video frame width. Clamped `64`–`4000`. |
 | `show_hidden`           | `bool`     | `false`           | Include dot files in scans and directory previews.                                 |
 | `fd_flags`              | `string[]` | _(unset)_         | **Full override** of the flags given to every `fd` call — see below.               |
 
@@ -209,7 +209,9 @@ Notes:
   a file re-shows its preview instantly. Renders larger than 3 MB of PNG are
   refused ("Thumbnail too large") rather than loaded. Files with nothing to
   render — unreadable files, binary or empty files, broken images — show an
-  "Unable to preview" placeholder instead of a blank pane.
+  "Unable to preview" placeholder instead of a blank pane; binary files (a
+  sampled head containing a NUL byte, e.g. MP3 ID3 padding) keep their full
+  `size · date · TYPE` caption.
 - Successful thumbnails persist on disk under
   `~/.cache/thumbnails/shafayet.finder/{pdf,video}/`, named by
   `md5("<path>|<size>|<mtime>|<inode>")` so an edited file never gets a stale

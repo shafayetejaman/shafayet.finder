@@ -335,8 +335,14 @@ var pcs = M.buildPdfPreviewCommand("/my pdf.pdf", "/tmp/base", "/store/pdf", 500
 ok(pcs[2].indexOf("md5sum | cut -d' ' -f1") !== -1, "disk key hashed with md5sum")
 ok(pcs[2].indexOf("stat -Lc %Y") !== -1, "source mtime feeds the disk key")
 ok(pcs[2].indexOf("stat -Lc %i") !== -1, "source inode feeds the disk key")
-ok(pcs[2].indexOf("printf '%s|%s|%s|%s\\n' '/my pdf.pdf' \"${sz:-?}\" \"${mt:-?}\" \"${in:-?}\"") !== -1,
-  "disk key hashes raw path text with size, mtime and inode")
+ok(pcs[2].indexOf("printf '%s|%s|%s|%s\\n' '/my pdf.pdf' \"${sz:-?}\" \"${kmt:-?}\" \"${in:-?}\"") !== -1,
+  "disk key hashes raw path text with size, epoch mtime and inode")
+ok(pcs[2].indexOf("mt=$(stat -Lc %y -- '/my pdf.pdf' 2>/dev/null | cut -d. -f1);") !== -1,
+  "human-readable source mtime captured for captions")
+ok(pcs[2].indexOf('printf "\\t%s\\t%s\\n" "${sz:-?}" "$mt";') !== -1,
+  "success headers carry size and mtime on both hit and fresh render")
+eq((pcs[2].match(/printf "\\t%s\\t%s\\n"/g) || []).length, 2,
+  "both disk-hit and render paths emit the two-field header")
 ok(pcs[2].indexOf("rm -f -- \"$thumb.part\"; { cp -f") !== -1,
   "publish unlinks .part first so a planted symlink cannot redirect writes")
 ok(pcs[2].indexOf("{ [ -d \"$store\" ] || mkdir -p -- \"$store\"; } 2>/dev/null && thumb=\"$store/$key.png\"") !== -1,
@@ -367,6 +373,11 @@ eq(M.formatBytes(0), "0 B", "bytes 0")
 eq(M.formatBytes(2048), "2.0 KB", "kilobytes")
 eq(M.parsePreviewOutput("\t123\t2026-01-01 10:00:00\nhello").size, 123, "preview size parsed")
 eq(M.parsePreviewOutput("\t123\t2026-01-01 10:00:00\nhello").content, "hello", "preview content parsed")
+eq(M.isBinaryContent("plain text\n"), false, "text content is not binary")
+eq(M.isBinaryContent(""), false, "empty content is not binary")
+eq(M.isBinaryContent(undefined), false, "missing content is not binary")
+eq(M.isBinaryContent("ID3\x04\x00\x00\x00"), true, "NUL byte marks binary (ID3 padding)")
+eq(M.isBinaryContent("\x7fELF\x02\x01\x01\x00"), true, "NUL byte marks binary (ELF header)")
 eq(M.isDirPath("/x/"), true, "dir marker")
 eq(M.isDirPath("/x"), false, "file has no marker")
 eq(M.cleanPath("/x///"), "/x", "cleanPath collapses slashes")
@@ -562,11 +573,55 @@ ok(vt.indexOf("mktemp -d -- '/tmp/thumbbase'.XXXXXX") !== -1, "per-job private s
 ok(vt.indexOf("-le " + M.thumbPngByteCeiling) !== -1 && vt.indexOf("printf '\\t-3\\t\\n'") !== -1,
   "producer-side png byte ceiling enforced")
 ok(vt.indexOf('rm -rf -- "$tmpd"') !== -1, "private scratch dir always cleaned")
-eq(M.buildVideoThumbnailCommand("/v/clip.mp4", "/tmp/thumbbase", "", 0)[2].indexOf("1200") !== -1,
+eq(M.buildVideoThumbnailCommand("/v/clip.mp4", "/tmp/thumbbase", "", 0)[2].indexOf(String(M.pdfRenderScale)) !== -1,
   true, "render scale defaults (persistence disabled)")
 ok(vt.indexOf("tail -n +301") !== -1, "video store prunes at its own cap")
 ok(vt.indexOf("grep -v '\\.part$'") !== -1,
   "video GC ignores in-flight .part temporaries too")
+ok(vt.indexOf('printf "\\t%s\\t%s\\n" "${sz:-?}" "$mt";') !== -1,
+  "video producer shares the size·mtime caption header")
+
+// ================= image stat command =================
+
+var st = M.buildStatCommand("/my img.png")
+eq(st[0], "bash", "stat cmd runs under bash")
+ok(st[2].indexOf("sz=$(stat -Lc %s -- '/my img.png' 2>/dev/null);") !== -1, "stat captures size with quoting")
+ok(st[2].indexOf("mt=$(stat -Lc %y -- '/my img.png' 2>/dev/null | cut -d. -f1);") !== -1, "stat captures human mtime")
+ok(st[2].indexOf('printf "\\t%s\\t%s\\n" "${sz:-?}" "$mt";') !== -1, "stat emits the two-field header")
+ok(st[2].indexOf("printf '\\t-1\\t\\n'; fi") !== -1, "unreadable marker present")
+ok(st[2].indexOf("head -c") === -1 && st[2].indexOf("base64") === -1, "caption probe emits no content")
+
+// ================= binary-file preview integration =================
+// The reported regression: MP3s (ID3v2 tags pad with NUL bytes) lost their
+// size·date·type caption and were reduced to a bare "binary" note. Proves
+// the real head-dump pipeline flags them while text stays clean.
+;(function integrationBinary() {
+  var tmp = fs.mkdtempSync(path.join(os.tmpdir(), "finder-bin-"))
+  var mp3 = path.join(tmp, "song.mp3")
+  // Minimal ID3v2 header: tag + version + flags + syncsafe size, then the
+  // NUL padding every writer emits.
+  fs.writeFileSync(mp3, Buffer.concat([
+    Buffer.from("ID3\x04\x00\x00\x00\x00\x00\x0a"),
+    Buffer.alloc(64, 0),
+    Buffer.from("\xff\xfb\x90\x44fake-frame-data")
+  ]))
+  var txt = path.join(tmp, "note.txt")
+  fs.writeFileSync(txt, "just words\n")
+
+  function probe(p) {
+    return M.parsePreviewOutput(cp.execFileSync(
+      "bash", ["-c", M.buildPreviewCommand(p, 65536)[2]], { encoding: "utf8" }))
+  }
+
+  var audio = probe(mp3)
+  ok(audio.size > 0 && audio.mtime !== "", "integration: mp3 probe keeps size and mtime fields")
+  eq(M.isBinaryContent(audio.content), true, "integration: mp3 bytes are flagged binary")
+
+  var plain = probe(txt)
+  eq(M.isBinaryContent(plain.content), false, "integration: text file never flagged binary")
+
+  fs.rmSync(tmp, { recursive: true, force: true })
+})()
 
 // ================= integration: real execution =================
 // Executes generated scripts against a throwaway tree to prove the bash

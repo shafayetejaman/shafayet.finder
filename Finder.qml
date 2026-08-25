@@ -79,6 +79,10 @@ Item {
   readonly property int pdfCacheLimit: root.cfg.pdfCacheLimit
   property var pdfCache: ({})
   property var pdfCacheKeys: []
+  // path -> "size · mtime" caption for image previews; a tiny stat fills this
+  // after pixels paint so the zero-spawn fast path never waits on it.
+  property var imageMetaCache: ({})
+  property var imageMetaKeys: []
   // path -> failed-at epoch ms; bounded LRU of recent render failures so a
   // pathological producer is not relaunched on every selection.
   readonly property int previewFailureTtlMs: Preview.previewFailureTtlMs
@@ -266,14 +270,51 @@ Item {
     // Oversize renders stay uncached so selecting the file later reports
     // "Thumbnail too large" instead of serving an empty warmed entry.
     if (parsed.size === -3) return
-    var meta = parsed.size === -2 ? root.dirMeta(parsed.mtime) : Core.formatBytes(parsed.size)
-    root.storePreviewInCache(key, meta, parsed.content)
+    var fields
+    if (parsed.size === -2) {
+      fields = { meta: root.dirMeta(parsed.mtime), content: parsed.content }
+    } else {
+      // Same binary gate as a live dispatch: raw bytes must never land in
+      // the cache as if they were text.
+      fields = root.classifyFilePreview(parsed.size, parsed.mtime, key, parsed.content)
+    }
+    root.storePreviewInCache(key, fields.meta, fields.content)
   }
 
   // Directory caption wording shared by warmed and live previews.
   function dirMeta(countText) {
     var items = parseInt(countText, 10)
     return "Directory — " + (isNaN(items) ? "?" : items) + " items"
+  }
+
+  // Upper-cased extension as a type tag; "" when there is none worth showing
+  // (dotfiles like ".gitignore" and trailing dots stay unlabeled).
+  function fileTypeLabel(path) {
+    var name = String(path || "")
+    var slash = name.lastIndexOf("/")
+    var base = slash >= 0 ? name.substring(slash + 1) : name
+    var dot = base.lastIndexOf(".")
+    if (dot <= 0 || dot === base.length - 1) return ""
+    return base.substring(dot + 1).toUpperCase()
+  }
+
+  // Shared file caption wording — "size  ·  mtime  ·  TYPE" — so warmed
+  // cache entries are indistinguishable from live dispatches.
+  function fileMeta(size, mtime, path) {
+    var meta = Core.formatBytes(size)
+    if (mtime) meta += "  ·  " + mtime
+    var ftype = root.fileTypeLabel(path)
+    if (ftype) meta += "  ·  " + ftype
+    return meta
+  }
+
+  // Shared text-vs-binary classification for generic file previews. Binary
+  // bytes never enter the cache or the pane; the caption stays the standard
+  // size · date · TYPE and the placeholder covers the empty pane.
+  function classifyFilePreview(size, mtime, path, content) {
+    if (Preview.isBinaryContent(content))
+      return { meta: root.fileMeta(size, mtime, path), content: "" }
+    return { meta: root.fileMeta(size, mtime, path), content: content }
   }
 
   function startBrowse() {
@@ -609,9 +650,23 @@ Item {
       { meta: meta, content: content })
   }
 
-  function storePdfInCache(path, url) {
+  function storePdfInCache(path, url, meta) {
     if (!path || !url) return
-    root.storeLru(root.pdfCache, root.pdfCacheKeys, root.pdfCacheLimit, path, { url: url })
+    root.storeLru(root.pdfCache, root.pdfCacheKeys, root.pdfCacheLimit, path,
+      { url: url, meta: meta || "" })
+  }
+
+  function storeImageMetaInCache(path, meta) {
+    if (!path || !meta) return
+    root.storeLru(root.imageMetaCache, root.imageMetaKeys, root.cfg.previewCacheLimit, path, meta)
+  }
+
+  // Caption for an already-painted image: cached stat strings return nothing
+  // to do; misses dispatch a cheap probe. A dropped job (pool busy) just
+  // leaves the caption empty until the next selection.
+  function requestImageMeta(forKey) {
+    if (!forKey || root.imageMetaCache[forKey] !== undefined) return
+    root.dispatchPreview("imgmeta", forKey, forKey, Preview.buildStatCommand(forKey))
   }
 
   function markPreviewFailed(path) {
@@ -662,14 +717,15 @@ Item {
     if (Core.isVideoPath(marked)) {
       var cleanVideo = Core.cleanPath(marked)
       var videoHit = root.cachedPdf(cleanVideo)
-      if (videoHit) return { kind: "thumb", url: videoHit.url }
+      if (videoHit) return { kind: "thumb", url: videoHit.url, meta: videoHit.meta || "" }
       if (root.recentlyFailedPreview(cleanVideo)) return { kind: "fail" }
       return { kind: "worker", workerKind: "video", cachePath: cleanVideo,
         command: Preview.buildVideoThumbnailCommand(cleanVideo, root.pdfPngBase,
           root.thumbStoreBase + "/video", root.cfg.thumbnailCacheLimit, root.cfg.pdfRenderScale) }
     }
     if (Core.isImagePath(marked)) {
-      return { kind: "image", url: Util.fileUrl(marked) }
+      var at = root.imageMetaCache[marked]
+      return { kind: "image", url: Util.fileUrl(marked), meta: at === undefined ? "" : at }
     }
     if (Core.isDirPath(marked)) {
       var cleanDir = Core.cleanPath(marked)
@@ -682,7 +738,7 @@ Item {
     if (Core.isPdfPath(marked)) {
       var cleanPdf = Core.cleanPath(marked)
       var pdfHit = root.cachedPdf(cleanPdf)
-      if (pdfHit) return { kind: "thumb", url: pdfHit.url }
+      if (pdfHit) return { kind: "thumb", url: pdfHit.url, meta: pdfHit.meta || "" }
       if (root.recentlyFailedPreview(cleanPdf)) return { kind: "fail" }
       return { kind: "worker", workerKind: "pdf", cachePath: cleanPdf,
         command: Preview.buildPdfPreviewCommand(cleanPdf, root.pdfPngBase,
@@ -700,8 +756,10 @@ Item {
     if (p.kind === "image" || p.kind === "thumb") {
       root.previewIsImage = true
       root.previewSource = p.url
-      root.previewMeta = ""
+      root.previewMeta = p.meta || ""
       root.previewContent = ""
+      // Images paint from their file URL first; a stat job fills the caption.
+      if (p.kind === "image" && !p.meta) root.requestImageMeta(displayKey)
     } else if (p.kind === "text") {
       root.previewIsImage = false
       root.previewMeta = p.meta
@@ -1037,12 +1095,24 @@ Item {
         }
         return
       }
-      root.storePdfInCache(worker.currentPath, url)
+      var meta = root.fileMeta(parsed.size, parsed.mtime, worker.currentPath)
+      root.storePdfInCache(worker.currentPath, url, meta)
       if (isSelected) {
         root.previewIsImage = true
         root.previewSource = url
-        root.previewMeta = ""
+        root.previewMeta = meta
         root.previewContent = ""
+      }
+      return
+    }
+
+    if (worker.kind === "imgmeta") {
+      // Caption-only probe: never touches pixels or the unavailable flag, so
+      // a failed stat just leaves the image captionless.
+      if (parsed.size >= 0 && parsed.mtime && !deadProducer) {
+        var imeta = root.fileMeta(parsed.size, parsed.mtime, worker.currentPath)
+        root.storeImageMetaInCache(worker.currentPath, imeta)
+        if (isSelected) root.previewMeta = imeta
       }
       return
     }
@@ -1067,23 +1137,14 @@ Item {
       }
       return
     }
-    var meta
-    var content
-    if (parsed.content.indexOf("\u0000") >= 0) {
-      meta = Core.formatBytes(parsed.size) + " — binary file"
-      content = ""
-    } else {
-      meta = Core.formatBytes(parsed.size)
-      if (parsed.mtime) meta += "  ·  " + parsed.mtime
-      content = parsed.content
-    }
-    root.storePreviewInCache(worker.currentPath, meta, content)
+    var fields = root.classifyFilePreview(parsed.size, parsed.mtime, worker.currentPath, parsed.content)
+    root.storePreviewInCache(worker.currentPath, fields.meta, fields.content)
     if (isSelected) {
-      root.previewMeta = meta
-      root.previewContent = content
-      // Binary and zero-byte files have nothing renderable: keep their size
+      root.previewMeta = fields.meta
+      root.previewContent = fields.content
+      // Binary and zero-byte files have nothing renderable: keep their full
       // caption but surface the placeholder instead of a blank pane.
-      root.previewUnavailable = content === ""
+      root.previewUnavailable = fields.content === ""
     }
   }
 
@@ -1230,6 +1291,10 @@ Item {
         }
 
         Item {
+          id: bodyArea
+          // Fixed minority share for the preview pane; the list takes the rest.
+          readonly property real previewShare: 0.45
+
           width: parent.width
           height: parent.height - root.headerHeight - root.contentSpacing
 
@@ -1238,7 +1303,7 @@ Item {
             spacing: 0
 
             Item {
-              width: parent.width / 2
+              width: parent.width * (1 - bodyArea.previewShare)
               height: parent.height
               clip: true
 
@@ -1272,7 +1337,7 @@ Item {
             }
 
             Item {
-              width: parent.width / 2
+              width: parent.width * bodyArea.previewShare
               height: parent.height
 
               PreviewPane {
