@@ -10,19 +10,12 @@ function fuzzyScore(line, query) {
   var q = String(query)
   if (!/[A-Z]/.test(q)) { text = text.toLowerCase(); q = q.toLowerCase() }
   if (!q) return 0
-  // Pre-compute character-position index: charCode -> sorted positions array.
-  // Eliminates repeated indexOf scans in the multi-start inner loop.
-  var charMap = {}
-  for (var i = 0; i < text.length; i++) {
-    var cc = text.charCodeAt(i)
-    var arr = charMap[cc]
-    if (arr) arr.push(i)
-    else charMap[cc] = [i]
+  var starts = []
+  var idx = text.indexOf(q.charAt(0))
+  while (idx !== -1 && starts.length < 16) {
+    starts.push(idx)
+    idx = text.indexOf(q.charAt(0), idx + 1)
   }
-  var qChars = []
-  for (var j = 0; j < q.length; j++) qChars.push(q.charCodeAt(j))
-  var starts = charMap[qChars[0]] || []
-  if (starts.length > 16) starts = starts.slice(0, 16)
   var best = -1
   for (var s = 0; s < starts.length; s++) {
     var score = 0
@@ -30,18 +23,9 @@ function fuzzyScore(line, query) {
     var prevIdx = starts[s] - 1
     var from = starts[s]
     var ok = true
-    for (var qi = 0; qi < qChars.length; qi++) {
-      var positions = charMap[qChars[qi]]
-      if (!positions) { ok = false; break }
-      // Binary search for the first position >= from.
-      var lo = 0, hi = positions.length
-      while (lo < hi) {
-        var mid = (lo + hi) >> 1
-        if (positions[mid] < from) lo = mid + 1
-        else hi = mid
-      }
-      if (lo >= positions.length) { ok = false; break }
-      var idx = positions[lo]
+    for (var qi = 0; qi < q.length; qi++) {
+      idx = text.indexOf(q.charAt(qi), from)
+      if (idx === -1) { ok = false; break }
       score += 16
       if (idx === prevIdx + 1) { run++; score += 4 + run * 2 } else { run = 0 }
       if (idx === 0 || !isWordChar(text.charAt(idx - 1))) score += 8

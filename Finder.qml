@@ -1139,16 +1139,10 @@ Item {
       onStreamFinished: {
         if (fdProc.revision !== root.fdSerial) return
         // Baseline = every walk line; what's displayed filters it client-side.
-        // Scan with indexOf instead of split to avoid 100K+ throwaway strings.
         var rows = []
-        var raw = String(text)
-        var start = 0
-        while (start < raw.length) {
-          var nl = raw.indexOf("\n", start)
-          var end = nl === -1 ? raw.length : nl
-          if (end - start > 1 && raw.charCodeAt(start) === 47) rows.push(raw.substring(start, end))
-          if (nl === -1) break
-          start = nl + 1
+        var lines = String(text).split("\n")
+        for (var i = 0; i < lines.length; i++) {
+          if (lines[i].length > 1 && lines[i].charAt(0) === "/") rows.push(lines[i])
         }
         root.lastFdKey = fdProc.pendingKey
         root.fdBaseRows = rows
