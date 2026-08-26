@@ -1459,7 +1459,7 @@ Item {
         FinderHeader {
           filterText: root.filterText
           scanning: root.scanning
-          searching: fdProc.running || searchProc.running || browseProc.running
+          searching: fdProc.running || browseProc.running
           invalid: Search.hasInvalidFlags(root.filterText, root.activeTab)
           entryCount: root.fileListCount
           fontFamily: root.fontFamily
