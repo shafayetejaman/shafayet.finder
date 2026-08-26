@@ -38,11 +38,12 @@ function tabArgs(tab) {
 // Stat-sort shell snippet that reads paths from stdin and emits them sorted
 // descending by the given stat field.  "mtime" uses %Y, "birth" uses %W.
 // Produces a pipe segment the caller appends to fd output.
+// xargs -P 8 parallelizes stat calls for faster sort on large result sets.
 function sortPipeSnippet(sortMode) {
   var field = sortMode === "birth" ? "%W" : "%Y"
-  return "| { while IFS= read -r __sp; do "
-    + "printf '%s\\t%s\\n' \"$(stat -c '" + field + "' -- \"$__sp\" 2>/dev/null || echo 0)\" \"$__sp\"; "
-    + "done; } | sort -t'	' -rn | cut -f2-"
+  return "| xargs -I {} -P 8 sh -c "
+    + "'printf \"%s\\t%s\\n\" \"$(stat -c '" + field + "' -- \"{}\" 2>/dev/null || echo 0)\" \"{}\"'"
+    + " | sort -t'	' -rn | cut -f2-"
 }
 
 // Flags that consume exactly one value token, mirroring fd's CLI.
