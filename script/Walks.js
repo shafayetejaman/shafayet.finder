@@ -164,33 +164,61 @@ function classifiedRelay(fdCmd, cap) {
     + " ) 2>/dev/null | head -n " + cap
 }
 
-function browseCommand(cfg) {
+function browseCommand(cfg, tabArgs, sortMode) {
+  tabArgs = Array.isArray(tabArgs) ? tabArgs : []
+  sortMode = sortMode || null
   if (cfg && cfg.fdOverrideArgs) {
-    var argStr = Core.shellJoin(cfg.fdOverrideArgs).join(" ")
+    var allArgs = cfg.fdOverrideArgs.concat(tabArgs)
+    var argStr = Core.shellJoin(allArgs).join(" ")
     var quoted = Core.shellQuote(cfg.browseDir)
     var ex = quotedExcludeSegment(cfg.browseDir, cfg)
     var fdCmd = "fd " + argStr + (ex ? " " + ex : "") + " --min-depth 1 --max-depth 1 . " + quoted
+    if (sortMode) {
+      fdCmd += " 2>/dev/null " + FdQuery.sortPipeSnippet(sortMode)
+      return ["bash", "-c",
+        "{ [ -d " + quoted + " ] || exit 0 ; } ; "
+        + termRelay(fdCmd) + " | head -n " + cfg.maxBrowseRows]
+    }
     return ["bash", "-c",
       "{ [ -d " + quoted + " ] || exit 0 ; } ; "
       + classifiedRelay(fdCmd + " 2>/dev/null", cfg.maxBrowseRows)]
   }
-  return browseCommandClassic(cfg)
+  return browseCommandClassic(cfg, tabArgs, sortMode)
 }
 
-// Empty-query browse snapshot of one directory. The classify snippet orders
-// directories first without trusting the walk order.
-function browseCommandClassic(cfg) {
+// Empty-query browse snapshot of one directory.  Tab args inject extension
+// or type filters; sort tabs replace dirs-first classify with a stat-based
+// descending pipeline.
+function browseCommandClassic(cfg, tabArgs, sortMode) {
+  tabArgs = Array.isArray(tabArgs) ? tabArgs : []
+  sortMode = sortMode || null
   var dir = cfg.browseDir
   var quoted = Core.shellQuote(dir)
   var flags = FdQuery.fdFlagSegment(cfg.fdFlags)
   if (cfg.showHidden) flags += "--hidden "
   var ex = quotedExcludeSegment(dir, cfg)
   if (ex) flags += ex + " "
+  // Tab args with --type replace the default pair; extension args append.
+  var hasTabType = false
+  for (var i = 0; i < tabArgs.length; i++) {
+    if (tabArgs[i] === "--type" || tabArgs[i] === "-t") { hasTabType = true; break }
+  }
+  if (hasTabType) {
+    flags += Core.shellJoin(tabArgs).join(" ") + " "
+  } else {
+    flags += "--type directory --type file "
+    if (tabArgs.length > 0) flags += Core.shellJoin(tabArgs).join(" ") + " "
+  }
+  var fdCmd = "fd " + flags + "--absolute-path --min-depth 1 --max-depth 1 . " + quoted + " 2>/dev/null"
+  if (sortMode) {
+    fdCmd += " " + FdQuery.sortPipeSnippet(sortMode)
+    return ["bash", "-c",
+      "{ [ -d " + quoted + " ] || exit 0 ; } ; "
+      + termRelay(fdCmd) + " | head -n " + cfg.maxBrowseRows]
+  }
   return ["bash", "-c",
     "{ [ -d " + quoted + " ] || exit 0 ; } ; "
-    + classifiedRelay("fd " + flags
-      + "--type directory --type file --absolute-path --min-depth 1 --max-depth 1 . " + quoted + " 2>/dev/null",
-      cfg.maxBrowseRows)]
+    + classifiedRelay(fdCmd, cfg.maxBrowseRows)]
 }
 
 // ================= resident change watcher =================

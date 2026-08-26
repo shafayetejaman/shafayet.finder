@@ -45,9 +45,19 @@ rescans.
 Open the finder from your configured launcher binding and start typing. With
 an empty query it browses a start directory instead of searching.
 
+A chip row below the search box shows filter tabs: **All** (classic), **Folder**,
+**Doc**, **Image**, **Music**, **PDF**, **Modified** (newest first), **Created**
+(newest first). Switching tabs clears the input. Non-All tabs use a recursive
+`fd` walk with injected type/extension flags; typed text fuzzy-filters the
+results in memory. Typing fd flags (e.g. `--size +5mb`) on a non-All tab is
+not allowed and shows **Invalid!** in the status bar. While a walk is in
+progress the status bar shows **searching…**.
+
 | Key                     | Action                   |
 | ----------------------- | ------------------------ |
 | any printable character | Type to filter           |
+| `Tab` / `Shift+Tab`     | Next / previous tab      |
+| `Ctrl+L` / `Ctrl+H`     | Next / previous tab      |
 | `Esc`                   | Clear filter, then close |
 | `Ctrl+Backspace`        | Delete last query word   |
 | `Up` / `Down`           | Move selection           |
@@ -253,13 +263,14 @@ Notes:
   - `Fuzzy.js` — client-side scoring/filtering
   - `FdQuery.js` — fd flag sanitizing and search-box query parsing
   - `Walks.js` — root guarding, excludes, relays, scan/browse commands
-  - `Search.js` — fzf filter command, live flag-mode walks, run identity
+  - `Search.js` — fzf filter command, live flag-mode walks, run identity, tab-flag validation
   - `Settings.js` — defaults and shell.json cfg resolution
   - `Preview.js` — preview/thumbnail producers, failure memo constants
 - `ShortcutHelp.qml` — Ctrl+Shift+/ keyboard-shortcuts modal
+- `FinderTabs.qml` — filter-tab chip row
 - `ResultRow.qml` — result-list row delegate
 - `PreviewPane.qml` — right-hand preview pane (text/image/thumbnail)
-- `FinderHeader.qml` — filter echo + entry-count/status bar
+- `FinderHeader.qml` — filter echo + entry-count/scanning/searching/invalid status
 - `EmptyState.qml` — no-results / scanning overlay
 
 ## License

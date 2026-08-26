@@ -64,6 +64,7 @@ Item {
   // undecodable): placeholder instead of stale pixels; reset per request.
   property bool previewUnavailable: false
   property bool helpVisible: false
+  property string activeTab: "all"
 
   // path -> { meta, content }; oldest-first keys for LRU eviction.
   readonly property int previewCacheLimit: root.cfg.previewCacheLimit
@@ -143,6 +144,7 @@ Item {
   property int contentFontSize: root.cfg.contentFontSize
   property int contentMargin: Style.spacing.panelPadding
   property int headerHeight: Math.max(Style.space(34), root.contentFontSize + Style.spacing.controlPaddingY * 2)
+  property int tabsHeight: root.contentFontSize + Style.spacing.controlPaddingY * 2 + Style.space(4)
   property int contentSpacing: Style.spacing.md
   property int cardWidth: Math.min(Style.space(875), panel.width - Style.gapsOut * 2)
   property int cardHeight: Math.min(Style.space(550), panel.height - Style.gapsOut * 2)
@@ -178,6 +180,7 @@ Item {
   function open(payloadJson) {
     root.opened = true
     root.filterText = ""
+    root.activeTab = "all"
     root.selectedIndex = 0
     root.cursorActive = true
     root.disarmPointer()
@@ -216,6 +219,40 @@ Item {
   function toggle() {
     if (root.opened) root.close()
     else root.open("{}")
+  }
+
+  function cycleTab(dir) {
+    var tabs = FdQuery.TAB_LIST
+    var idx = tabs.indexOf(root.activeTab)
+    if (idx === -1) idx = 0
+    idx = (idx + dir + tabs.length) % tabs.length
+    root.setActiveTab(tabs[idx])
+  }
+
+  function setActiveTab(tab) {
+    if (tab === root.activeTab) return
+    root.activeTab = tab
+    root.filterText = ""
+    root.selectedIndex = 0
+    root.cursorActive = true
+    root.disarmPointer()
+    root.cancelPendingWork()
+    root.lastFdKey = ""
+    root.fdBaseRows = []
+    root.fdWarmCache = null
+    searchDebounce.stop()
+    fdDebounce.stop()
+    browseDebounce.stop()
+    if (!root.opened) return
+    // Non-all tabs need the recursive fd walk even with empty query;
+    // only the "all" tab uses the depth-limited browse.
+    if (tab === "all") {
+      root.rebuildDisplay(true)
+      root.startBrowse()
+    } else {
+      root.rebuildDisplay(false)
+      root.requestSearch()
+    }
   }
 
   // A Process ignores `running = true` until fully exited: mid-teardown work
@@ -376,7 +413,8 @@ Item {
     }
     root.browseSerial++
     browseProc.revision = root.browseSerial
-    browseProc.command = Walks.browseCommand(root.cfg)
+    var tabInfo = FdQuery.tabArgs(root.activeTab)
+    browseProc.command = Walks.browseCommand(root.cfg, tabInfo.args, tabInfo.sort)
     browseProc.running = true
   }
 
@@ -384,22 +422,31 @@ Item {
     if (!root.opened) return
 
     var query = root.filterText.trim()
-    if (!query) {
-      root.startBrowse()
+
+    // Manual flags on a non-'all' tab are not allowed — clear results.
+    if (Search.hasInvalidFlags(query, root.activeTab)) {
+      root.searchResults = []
+      root.rebuildDisplay()
       return
     }
 
-    // Flag queries walk the roots live — the persisted index is irrelevant.
-    var parsed = FdQuery.parseQuery(query)
-    if (parsed.args.length > 0) {
-      if (!parsed.fdPattern) {
+    // Resolve against active tab: non-null means fd-walk path.
+    var result = Search.effectiveQuery(query, root.activeTab)
+    // Non-all tabs use the fd walk even with empty query (type/extension/sort
+    // filters need a recursive walk, not the depth-limited browse).
+    if (!query && !result) {
+      root.startBrowse()
+      return
+    }
+    if (result) {
+      if (!result.fdPattern && !result.sortMode) {
         root.searchResults = []
         root.rebuildDisplay()
         return
       }
       // Same completed walk (e.g. a background rescan landed mid-query):
       // refilter the baseline instantly instead of killing and re-walking.
-      var key = Search.fdCacheKey(root.cfg, parsed)
+      var key = Search.fdCacheKey(root.cfg, result)
       if (key !== "" && key === root.lastFdKey) {
         refreshFlagDisplay()
         return
@@ -433,7 +480,9 @@ Item {
     if (!searchProc.queuedStart) return
     searchProc.queuedStart = false
     var query = root.filterText.trim()
-    if (!query || !root.opened || FdQuery.parseQuery(query).args.length > 0 || root.fileListCount === 0) return
+    if (!query || !root.opened || root.fileListCount === 0) return
+    // If tabs resolve to an fd walk, this is not the classic fzf path.
+    if (Search.effectiveQuery(query, root.activeTab)) return
     searchProc.revision = root.searchSerial
     searchProc.command = Search.buildSearchCommand(root.listPath, query, root.cfg.maxDisplayRows)
     searchProc.running = true
@@ -442,13 +491,13 @@ Item {
   function startFdSearch() {
     if (!fdProc.queuedStart) return
     fdProc.queuedStart = false
-    var parsed = FdQuery.parseQuery(root.filterText.trim())
-    if (!root.opened || parsed.args.length === 0 || !parsed.fdPattern) return
+    var result = Search.effectiveQuery(root.filterText.trim(), root.activeTab)
+    if (!root.opened || !result || (!result.fdPattern && !result.sortMode)) return
     // Only a finished run promotes pendingKey to lastFdKey, so typing during
     // the walk can never poison the warm path.
-    fdProc.pendingKey = Search.fdCacheKey(root.cfg, parsed)
+    fdProc.pendingKey = Search.fdCacheKey(root.cfg, result)
     fdProc.revision = root.fdSerial
-    fdProc.command = Search.liveFdCommand(root.cfg, parsed, root.cfg.maxScanResults)
+    fdProc.command = Search.liveFdCommand(root.cfg, result, root.cfg.maxScanResults)
     fdProc.running = true
   }
 
@@ -509,8 +558,8 @@ Item {
   }
 
   function fdStagedText() {
-    var p = FdQuery.parseQuery(root.filterText.trim())
-    return (p.args.length > 0 && p.fdPattern) ? String(p.fzfQuery || "") : ""
+    var result = Search.effectiveQuery(root.filterText.trim(), root.activeTab)
+    return result ? String(result.fzfQuery || "") : ""
   }
 
   // Warm path: same-key edits land here with zero latency. The generous cap
@@ -543,21 +592,30 @@ Item {
     root.cancelPendingWork()
     searchDebounce.stop()
     fdDebounce.stop()
-    var parsed = FdQuery.parseQuery(nextFilter)
-    if (parsed.args.length === 0 || !parsed.fdPattern) {
+    // Manual flags on a non-'all' tab are not allowed — clear results.
+    if (Search.hasInvalidFlags(nextFilter, root.activeTab)) {
+      root.lastFdKey = ""
+      root.fdBaseRows = []
+      root.fdWarmCache = null
+      root.searchResults = []
+      root.rebuildDisplay()
+      return
+    }
+    var result = Search.effectiveQuery(nextFilter, root.activeTab)
+    if (!result || (!result.fdPattern && !result.sortMode)) {
       root.lastFdKey = ""
       root.fdBaseRows = []
       root.fdWarmCache = null
     }
-    if (parsed.args.length > 0) {
-      if (!parsed.fdPattern) {
+    if (result) {
+      if (!result.fdPattern && !result.sortMode) {
         root.searchResults = []
         root.rebuildDisplay()
         return
       }
       // Same walk as displayed: refilter the baseline in memory — instant in
       // both directions, no clearing.
-      var key = Search.fdCacheKey(root.cfg, parsed)
+      var key = Search.fdCacheKey(root.cfg, result)
       if (key !== "" && key === root.lastFdKey) {
         refreshFlagDisplay()
         return
@@ -1335,6 +1393,18 @@ Item {
             // Must run before Util.editsFilter or plain backspace eats Ctrl.
             root.setFilter(Core.deleteLastWord(root.filterText))
             event.accepted = true
+          } else if (event.key === Qt.Key_Tab) {
+            root.cycleTab(event.modifiers & Qt.ShiftModifier ? -1 : 1)
+            event.accepted = true
+          } else if (event.key === Qt.Key_Backtab) {
+            root.cycleTab(-1)
+            event.accepted = true
+          } else if (event.key === Qt.Key_L && (event.modifiers & Qt.ControlModifier)) {
+            root.cycleTab(1)
+            event.accepted = true
+          } else if (event.key === Qt.Key_H && (event.modifiers & Qt.ControlModifier)) {
+            root.cycleTab(-1)
+            event.accepted = true
           } else if (Util.editsFilter(event, root.filterText)) {
             root.setFilter(Util.editedFilter(event, root.filterText))
             event.accepted = true
@@ -1389,6 +1459,8 @@ Item {
         FinderHeader {
           filterText: root.filterText
           scanning: root.scanning
+          searching: fdProc.running || searchProc.running || browseProc.running
+          invalid: Search.hasInvalidFlags(root.filterText, root.activeTab)
           entryCount: root.fileListCount
           fontFamily: root.fontFamily
           headingSize: root.cfg.contentHeading
@@ -1398,13 +1470,24 @@ Item {
           height: root.headerHeight
         }
 
+        FinderTabs {
+          id: tabsRow
+          activeTab: root.activeTab
+          fontFamily: root.fontFamily
+          captionSize: root.cfg.contentCaption
+          contentSize: root.contentFontSize
+          width: parent.width
+          height: root.tabsHeight
+          onTabSelected: function(tab) { root.setActiveTab(tab) }
+        }
+
         Item {
           id: bodyArea
           // Fixed minority share for the preview pane; the list takes the rest.
           readonly property real previewShare: 0.45
 
           width: parent.width
-          height: parent.height - root.headerHeight - root.contentSpacing
+          height: parent.height - root.headerHeight - root.tabsHeight - root.contentSpacing * 2
 
           Row {
             anchors.fill: parent

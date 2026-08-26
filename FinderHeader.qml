@@ -7,6 +7,8 @@ Rectangle {
 
   property string filterText: ""
   property bool scanning: false
+  property bool searching: false
+  property bool invalid: false
   property int entryCount: 0
   property string fontFamily: Style.font.menuFamily
   property int headingSize: 16
@@ -37,10 +39,10 @@ Rectangle {
 
   Text {
     id: statusLabel
-    visible: !headerRoot.filterText && (headerRoot.scanning || headerRoot.entryCount > 0)
+    visible: headerRoot.invalid || headerRoot.searching || (!headerRoot.filterText && (headerRoot.scanning || headerRoot.entryCount > 0))
     anchors.right: parent.right
     anchors.verticalCenter: parent.verticalCenter
-    text: headerRoot.scanning ? "scanning…" : headerRoot.entryCount.toLocaleString() + " entries"
+    text: headerRoot.invalid ? "Invalid!" : headerRoot.searching ? "searching…" : headerRoot.scanning ? "scanning…" : headerRoot.entryCount.toLocaleString() + " entries"
     textFormat: Text.PlainText
     color: Color.menu.text
     opacity: 0.5

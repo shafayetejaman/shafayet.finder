@@ -1065,4 +1065,211 @@ ok(!M.isFailureFresh(2000, 1000, M.previewFailureTtlMs), "clock skew in the past
 ok(!M.isFailureFresh(0, 5000, M.previewFailureTtlMs), "zero timestamp never blocks")
 ok(!M.isFailureFresh(NaN, 5000, M.previewFailureTtlMs), "garbage timestamp never blocks")
 
+// ================= tabArgs =================
+
+eq(M.TAB_LIST, ["all", "folder", "document", "image", "music", "pdf", "modified", "created"],
+  "TAB_LIST has all eight tabs in order")
+eq(M.tabArgs("all"), { args: [], sort: null }, "all tab → no flags")
+eq(M.tabArgs("folder"), { args: ["--type", "directory"], sort: null }, "folder tab → --type directory")
+eq(M.tabArgs("pdf"), { args: ["-e", "pdf"], sort: null }, "pdf tab → single extension")
+eq(M.tabArgs("modified"), { args: [], sort: "mtime" }, "modified tab → mtime sort")
+eq(M.tabArgs("created"), { args: [], sort: "birth" }, "created tab → birth sort")
+eq(M.tabArgs("unknown"), { args: [], sort: null }, "unknown tab → no flags")
+eq(M.tabArgs(""), { args: [], sort: null }, "empty tab → no flags")
+
+var docArgs = M.tabArgs("document").args
+ok(docArgs.indexOf("-e") !== -1, "document tab has extension flags")
+ok(docArgs.indexOf("pdf") !== -1, "document tab includes pdf")
+ok(docArgs.indexOf("docx") !== -1, "document tab includes docx")
+ok(docArgs.indexOf("txt") !== -1, "document tab includes txt")
+ok(docArgs.length % 2 === 0, "document tab args come in flag-value pairs")
+
+var imgArgs = M.tabArgs("image").args
+ok(imgArgs.indexOf("png") !== -1, "image tab includes png")
+ok(imgArgs.indexOf("jpg") !== -1, "image tab includes jpg")
+ok(imgArgs.indexOf("webp") !== -1, "image tab includes webp")
+
+var musArgs = M.tabArgs("music").args
+ok(musArgs.indexOf("mp3") !== -1, "music tab includes mp3")
+ok(musArgs.indexOf("flac") !== -1, "music tab includes flac")
+
+// ================= sortPipeSnippet =================
+
+var mtimePipe = M.sortPipeSnippet("mtime")
+ok(mtimePipe.indexOf("%Y") !== -1, "mtime sort uses stat %Y")
+ok(mtimePipe.indexOf("sort") !== -1, "mtime sort includes sort")
+ok(mtimePipe.indexOf("cut") !== -1, "mtime sort includes cut to strip timestamps")
+
+var birthPipe = M.sortPipeSnippet("birth")
+ok(birthPipe.indexOf("%W") !== -1, "birth sort uses stat %W")
+ok(birthPipe.indexOf("sort") !== -1, "birth sort includes sort")
+
+// ================= effectiveQuery =================
+
+eq(M.effectiveQuery("invoice", "all"), null,
+  "plain text on all tab → null (classic path)")
+eq(M.effectiveQuery("", "all"), null,
+  "empty text on all tab → null")
+eq(M.effectiveQuery("--size +5mb invoice", "all"),
+  { args: ["--size", "+5mb"], fdPattern: "invoice", fzfQuery: "" },
+  "manual flags on all tab → classic flag mode")
+eq(M.effectiveQuery("invoice", "folder"),
+  { args: ["--type", "directory"], fdPattern: ".", fzfQuery: "invoice", sortMode: null },
+  "plain text on folder tab → type dir + fzf staging")
+eq(M.effectiveQuery("report", "pdf"),
+  { args: ["-e", "pdf"], fdPattern: ".", fzfQuery: "report", sortMode: null },
+  "plain text on pdf tab → extension + fzf staging")
+eq(M.effectiveQuery("", "modified"),
+  { args: [], fdPattern: ".", fzfQuery: "", sortMode: "mtime" },
+  "empty text on modified tab → mtime sort, match-all")
+eq(M.effectiveQuery("", "created"),
+  { args: [], fdPattern: ".", fzfQuery: "", sortMode: "birth" },
+  "empty text on created tab → birth sort, match-all")
+eq(M.effectiveQuery("report paid", "document"),
+  { args: M.tabArgs("document").args, fdPattern: ".", fzfQuery: "report paid", sortMode: null },
+  "multi-word text on document tab → merged args, full text staged")
+eq(M.effectiveQuery("--size +5mb invoice", "document"),
+  { args: ["--size", "+5mb"].concat(M.tabArgs("document").args), fdPattern: ".", fzfQuery: "invoice", sortMode: null },
+  "manual flags + text on document tab → merged, text staged")
+
+// ================= fdCacheKey with sortMode =================
+
+var keyCfg = M.resolveSettings({ search_dirs: ["/r1"] }, HOME)
+var qAll = M.effectiveQuery("report", "all")
+var qMod = M.effectiveQuery("report", "modified")
+ok(M.fdCacheKey(keyCfg, qAll) === "", "classic query on all tab → no key")
+ok(M.fdCacheKey(keyCfg, qMod) !== "", "modified tab produces a cache key")
+ok(M.fdCacheKey(keyCfg, qMod) !== M.fdCacheKey(keyCfg, M.effectiveQuery("report", "created")),
+  "modified and created tabs produce different keys")
+
+// ================= browseCommand with tab args =================
+
+var browseTabCfg = M.resolveSettings({ browse_dir: "/tmp/tab-browse" }, HOME)
+var bDoc = M.browseCommand(browseTabCfg, M.tabArgs("document").args, null)[2]
+ok(bDoc.indexOf("-e") !== -1, "browse with document tab has extension flags")
+ok(bDoc.indexOf("'pdf'") !== -1, "browse with document tab quotes pdf extension")
+ok(bDoc.indexOf("@@DIRS@@") !== -1, "browse with extension tab still classifies dirs first")
+
+var bMod = M.browseCommand(browseTabCfg, [], "mtime")[2]
+ok(bMod.indexOf("stat") !== -1, "browse with modified tab includes stat")
+ok(bMod.indexOf("sort") !== -1, "browse with modified tab includes sort")
+ok(bMod.indexOf("@@DIRS@@") === -1, "browse with sort tab skips classify")
+
+var bFolder = M.browseCommand(browseTabCfg, ["--type", "directory"], null)[2]
+ok(bFolder.indexOf("directory") !== -1, "browse with folder tab injects directory type")
+ok(bFolder.indexOf("--type file") === -1, "browse with folder tab omits --type file")
+
+// ================= liveFdCommand with sortMode =================
+
+var liveSortCfg = M.resolveSettings({ search_dirs: ["/r1"] }, HOME)
+var lfMod = M.liveFdCommand(liveSortCfg,
+  { args: [], fdPattern: ".", fzfQuery: "", sortMode: "mtime" }, 5000)[2]
+ok(lfMod.indexOf("stat") !== -1, "live fd with mtime sort includes stat")
+ok(lfMod.indexOf("sort") !== -1, "live fd with mtime sort includes sort")
+ok(lfMod.indexOf("cut") !== -1, "live fd with mtime sort strips timestamps")
+ok(lfMod.indexOf("'.'") !== -1, "live fd with sort uses match-all pattern")
+ok(lfMod.trim().endsWith("| head -n 5000"), "live fd sort output capped by head")
+
+var lfBorn = M.liveFdCommand(liveSortCfg,
+  { args: [], fdPattern: ".", fzfQuery: "", sortMode: "birth" }, 5000)[2]
+ok(lfBorn.indexOf("%W") !== -1, "live fd with birth sort uses %W stat field")
+
+// live fd with extension args + sort
+var lfExtMod = M.liveFdCommand(liveSortCfg,
+  { args: ["-e", "pdf"], fdPattern: ".", fzfQuery: "report", sortMode: "mtime" }, 5000)[2]
+ok(lfExtMod.indexOf("'pdf'") !== -1, "live fd merges extension arg with sort")
+ok(lfExtMod.indexOf("stat") !== -1, "live fd with extension + sort includes stat")
+
+// ================= integration: tab-filtered walk =================
+
+;(function integrationTabs() {
+  var tmp = "/tmp/fdr-tabs-" + process.pid
+  var root = path.join(tmp, "tree")
+  fs.rmSync(tmp, { recursive: true, force: true })
+  fs.mkdirSync(path.join(root, "sub"), { recursive: true })
+  fs.writeFileSync(path.join(root, "a.txt"), "alpha")
+  fs.writeFileSync(path.join(root, "b.pdf"), "%PDF-fake")
+  fs.writeFileSync(path.join(root, "c.png"), Buffer.alloc(100, 0xff))
+  fs.writeFileSync(path.join(root, "sub", "d.md"), "# hello")
+  fs.writeFileSync(path.join(root, "sub", "e.flac"), "audio")
+
+  var cfg = M.resolveSettings({ search_dirs: [root] }, HOME)
+  function runLive(query, tab) {
+    var effective = M.effectiveQuery(query, tab)
+    if (!effective) return null
+    var cmd = M.liveFdCommand(cfg, effective, 50)
+    var out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+    return out.split("\n").filter(function (l) { return l.length > 1 && l.charAt(0) === "/" })
+  }
+
+  // document tab filters to txt/pdf/md only
+  var docs = runLive("", "document").sort()
+  ok(docs.length === 3, "document tab returns exactly 3 files")
+  ok(docs.some(function(p) { return p.indexOf(".pdf") !== -1 }), "document tab includes .pdf")
+  ok(docs.some(function(p) { return p.indexOf(".md") !== -1 }), "document tab includes .md")
+  ok(docs.some(function(p) { return p.indexOf(".txt") !== -1 }), "document tab includes .txt")
+
+  // music tab filters to flac only
+  var music = runLive("", "music")
+  eq(music.length, 1, "music tab returns exactly 1 file")
+  ok(music[0].indexOf(".flac") !== -1, "music tab includes .flac")
+
+  // folder tab returns directories only
+  var folders = runLive("", "folder")
+  ok(folders.length >= 1, "folder tab returns at least 1 directory")
+  folders.forEach(function (p) {
+    ok(p.charAt(p.length - 1) === "/" || p.indexOf("sub") !== -1,
+      "folder tab entry is a directory: " + p)
+  })
+
+  // modified tab returns all entries sorted by mtime (descending)
+  var modified = runLive("", "modified")
+  eq(modified.length, 6, "modified tab returns all 6 entries (5 files + 1 dir)")
+
+  // all tab with plain text → classic path (null from effectiveQuery)
+  eq(M.effectiveQuery("a.txt", "all"), null, "all tab plain text → classic")
+
+  // extension tab + text filters via fd pattern
+  var imgText = runLive("c", "image")
+  eq(imgText.length, 1, "image tab + text 'c' returns 1 match")
+  ok(imgText[0].indexOf(".png") !== -1, "image tab + text 'c' matches the png")
+
+  fs.rmSync(tmp, { recursive: true, force: true })
+})()
+
+// ================= integration: tab sort order =================
+
+;(function integrationTabSort() {
+  var tmp = "/tmp/fdr-tabsort-" + process.pid
+  var root = path.join(tmp, "tree")
+  fs.rmSync(tmp, { recursive: true, force: true })
+  fs.mkdirSync(root, { recursive: true })
+  fs.writeFileSync(path.join(root, "old.txt"), "old")
+  fs.writeFileSync(path.join(root, "mid.txt"), "mid")
+  fs.writeFileSync(path.join(root, "new.txt"), "new")
+
+  // Stagger mtimes: old 2h ago, mid 1h ago, new = now
+  var now = Date.now()
+  fs.utimesSync(path.join(root, "old.txt"), new Date(now - 7200000), new Date(now - 7200000))
+  fs.utimesSync(path.join(root, "mid.txt"), new Date(now - 3600000), new Date(now - 3600000))
+  fs.utimesSync(path.join(root, "new.txt"), new Date(now), new Date(now))
+
+  var cfg = M.resolveSettings({ search_dirs: [root] }, HOME)
+  function runSort(tab) {
+    var effective = M.effectiveQuery("", tab)
+    var cmd = M.liveFdCommand(cfg, effective, 50)
+    var out = cp.execFileSync(cmd[0], [cmd[1], cmd[2]], { encoding: "utf8" })
+    return out.split("\n").filter(function (l) { return l.length > 1 && l.charAt(0) === "/" })
+  }
+
+  var byMod = runSort("modified")
+  eq(byMod.length, 3, "modified sort returns all 3 files")
+  // Newest first
+  ok(byMod[0].indexOf("new.txt") !== -1, "modified sort: newest first")
+  ok(byMod[1].indexOf("mid.txt") !== -1, "modified sort: mid second")
+  ok(byMod[2].indexOf("old.txt") !== -1, "modified sort: oldest last")
+
+  fs.rmSync(tmp, { recursive: true, force: true })
+})()
+
 console.log("OK — " + passed + " assertions passed")

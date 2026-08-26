@@ -13,6 +13,8 @@ Item {
 
   readonly property var shortcuts: [
     { keys: "Type", action: "Filter files" },
+    { keys: "Tab / Shift+Tab", action: "Next / previous filter tab" },
+    { keys: "Ctrl+L / Ctrl+H", action: "Next / previous filter tab" },
     { keys: "Esc", action: "Clear filter / close finder" },
     { keys: "Ctrl+Backspace", action: "Delete last filter word" },
     { keys: "\u2191 / \u2193  or  Ctrl+J / Ctrl+K", action: "Move selection" },

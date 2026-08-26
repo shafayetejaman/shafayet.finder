@@ -1,7 +1,49 @@
 // fd flag handling: user-flag sanitizing, exec/color gates, override-mode
-// argument assembly, and search-box query parsing.
+// argument assembly, search-box query parsing, and filter-tab definitions.
 
 .import "Core.js" as Core
+
+// Ordered tab ids for the UI chip row.  "all" is the default (no flags).
+var TAB_LIST = ["all", "folder", "document", "image", "music", "pdf", "modified", "created"]
+
+// Per-tab fd args and optional stat-sort mode.  Extension tabs emit repeated
+// -e pairs; sort tabs return an empty args array plus a mode string that the
+// caller wires into a stat-based descending pipeline.
+function tabArgs(tab) {
+  var id = String(tab || "").toLowerCase()
+  switch (id) {
+  case "folder":
+    return { args: ["--type", "directory"], sort: null }
+  case "document":
+    return { args: ["-e", "pdf", "-e", "doc", "-e", "docx", "-e", "odt", "-e", "rtf",
+                     "-e", "txt", "-e", "md", "-e", "xls", "-e", "xlsx", "-e", "csv",
+                     "-e", "ppt", "-e", "pptx", "-e", "epub"], sort: null }
+  case "image":
+    return { args: ["-e", "png", "-e", "jpg", "-e", "jpeg", "-e", "gif", "-e", "webp",
+                     "-e", "svg", "-e", "bmp", "-e", "tiff", "-e", "ico"], sort: null }
+  case "music":
+    return { args: ["-e", "mp3", "-e", "flac", "-e", "wav", "-e", "ogg", "-e", "opus",
+                     "-e", "m4a", "-e", "aac", "-e", "wma"], sort: null }
+  case "pdf":
+    return { args: ["-e", "pdf"], sort: null }
+  case "modified":
+    return { args: [], sort: "mtime" }
+  case "created":
+    return { args: [], sort: "birth" }
+  default:
+    return { args: [], sort: null }
+  }
+}
+
+// Stat-sort shell snippet that reads paths from stdin and emits them sorted
+// descending by the given stat field.  "mtime" uses %Y, "birth" uses %W.
+// Produces a pipe segment the caller appends to fd output.
+function sortPipeSnippet(sortMode) {
+  var field = sortMode === "birth" ? "%W" : "%Y"
+  return "| { while IFS= read -r __sp; do "
+    + "printf '%s\\t%s\\n' \"$(stat -c '" + field + "' -- \"$__sp\" 2>/dev/null || echo 0)\" \"$__sp\"; "
+    + "done; } | sort -t'	' -rn | cut -f2-"
+}
 
 // Flags that consume exactly one value token, mirroring fd's CLI.
 var FD_VALUE_FLAGS = {
@@ -170,6 +212,9 @@ if (typeof module !== "undefined") {
     hasColorFlag: hasColorFlag,
     fdFlagSegment: fdFlagSegment,
     fdOverrideArgs: fdOverrideArgs,
-    parseQuery: parseQuery
+    parseQuery: parseQuery,
+    TAB_LIST: TAB_LIST,
+    tabArgs: tabArgs,
+    sortPipeSnippet: sortPipeSnippet
   }
 }
