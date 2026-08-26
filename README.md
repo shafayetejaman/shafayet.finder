@@ -21,16 +21,24 @@ omarchy plugin remove shafayet.finder
 
 ## Dependencies
 
-| Tool                                                       | Preinstall | Needed for                         | Install if missing                  |
-| ---------------------------------------------------------- | ---------- | ---------------------------------- | ----------------------------------- |
-| `fd`                                                       | Yes        | Search index and flag-mode queries | `sudo pacman -S --needed fd`        |
-| `fzf`                                                      | Yes        | Fuzzy ranking of results           | `sudo pacman -S --needed fzf`       |
-| [`poppler`](https://poppler.freedesktop.org/) (`pdftoppm`) | No         | PDF page thumbnails                | `sudo pacman -S --needed poppler`   |
-| `ffmpeg`                                                   | No         | Video frame previews               | `sudo pacman -S --needed ffmpeg`    |
-| [`trash-cli`](https://github.com/andreafrancia/trash-cli)  | No         | Delete-to-trash keybind            | `sudo pacman -S --needed trash-cli` |
+Install everything in one line (`--needed` skips what's already present):
+
+```bash
+sudo pacman -S --needed fd fzf poppler ffmpeg trash-cli inotify-tools
+```
+
+| Tool                                                       | Preinstalled | Needed for                         |
+| ---------------------------------------------------------- | ------------ | ---------------------------------- |
+| `fd`                                                       | Yes          | Search index and flag-mode queries |
+| `fzf`                                                      | Yes          | Fuzzy ranking of results           |
+| [`poppler`](https://poppler.freedesktop.org/) (`pdftoppm`) | No           | PDF page thumbnails                |
+| `ffmpeg`                                                   | No           | Video frame previews               |
+| [`trash-cli`](https://github.com/andreafrancia/trash-cli)  | No           | Delete-to-trash keybind            |
+| [`inotify-tools`](https://github.com/inotify-tools/inotify-tools) (`inotifywait`) | Yes | Event-driven index invalidation |
 
 Optional tools degrade gracefully: the finder works without them, minus that
-one feature.
+one feature. Without `inotifywait` the index simply falls back to interval
+rescans.
 
 ## Usage
 
@@ -124,6 +132,7 @@ aggressive values stay safe.
 | `debounce_ms`           | `int`      | `40`              | Delay from keystroke/selection to its search/preview launch.                       |
 | `fd_debounce_ms`        | `int`      | `1000`            | Debounce for flag-mode queries, which walk real directory trees.                   |
 | `rescan_interval_ms`    | `int`      | `300000`          | Minimum time between full rescans; `0` rescans on every open.                      |
+| `event_scan`            | `bool\|"auto"` | `"auto"`      | Watcher-based index invalidation; `"auto"` enables it when `inotifywait` exists.   |
 | `pdf_render_scale`      | `int`      | `800`             | `-scale-to` for page thumbnails; also caps video frame width. Clamped `64`–`4000`. |
 | `show_hidden`           | `bool`     | `false`           | Include dot files in scans and directory previews.                                 |
 | `fd_flags`              | `string[]` | _(unset)_         | **Full override** of the flags given to every `fd` call — see below.               |
@@ -205,6 +214,17 @@ Notes:
   every path indexes exactly once.
 - `ignored_dirs` translates to cross-root `**/<suffix>` excludes; a root
   listed there drops out entirely.
+- With `inotifywait` available (part of Omarchy's base packages), a resident
+  recursive watcher makes rescans **event-driven**: kernel events over the
+  search roots — mirroring the scan policy's excludes, so churn inside
+  never-indexed trees cannot trigger anything — are coalesced through a
+  2 s quiet window into a dirty flag, and the *next open* runs exactly one
+  walk to satisfy it. A static file structure therefore costs zero scans,
+  and changes made while the finder is closed cost nothing but that flag.
+  The watcher itself sleeps in the kernel between events (no idle CPU);
+  crashes retry three times, and watch-limit exhaustion or three failures
+  fall back silently to interval scanning until the next shell start.
+  Changes from before shell start are covered by the startup walk either way.
 - Previews cache in memory for the whole session, keyed by path, so revisiting
   a file re-shows its preview instantly. Renders larger than 3 MB of PNG are
   refused ("Thumbnail too large") rather than loaded. Files with nothing to

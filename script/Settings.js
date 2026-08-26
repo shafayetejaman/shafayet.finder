@@ -44,6 +44,17 @@ function searchDirs(settings, home) {
   return expanded.length > 0 ? expanded : [home]
 }
 
+// Event-driven index invalidation: true/false force the watcher on/off,
+// anything else (including the default) means "auto" — on when inotifywait
+// is present. Finder.qml pairs this with its binary probe.
+var eventScanAuto = "auto"
+
+function eventScan(settings) {
+  var value = Core.setting(settings, "event_scan", eventScanAuto)
+  if (value === true || value === false) return value
+  return eventScanAuto
+}
+
 // Overlapping roots would make one combined walk emit paths twice; collapse
 // exact repeats, then drop roots contained by a surviving one. Order preserved.
 function pruneContainedRoots(dirs) {
@@ -98,6 +109,7 @@ function resolveSettings(settings, home) {
     debounceMs: Core.nonNegativeInt(settings, "debounce_ms", debounceMs),
     fdDebounceMs: Core.nonNegativeInt(settings, "fd_debounce_ms", fdDebounceMs),
     rescanIntervalMs: Core.nonNegativeInt(settings, "rescan_interval_ms", rescanIntervalMs),
+    eventScan: eventScan(settings),
     pdfRenderScale: Math.min(4000, Math.max(64, Core.positiveInt(settings, "pdf_render_scale", pdfRenderScale))),
     showHidden: Core.boolSetting(settings, "show_hidden", false),
     contentFontSize: Core.positiveInt(settings, "content_font_size", fontTitle),
@@ -122,6 +134,8 @@ if (typeof module !== "undefined") {
     debounceMs: debounceMs,
     fdDebounceMs: fdDebounceMs,
     rescanIntervalMs: rescanIntervalMs,
+    eventScanAuto: eventScanAuto,
+    eventScan: eventScan,
     thumbnailCacheLimit: thumbnailCacheLimit,
     builtinIgnoreNames: builtinIgnoreNames,
     ignoredNames: ignoredNames,

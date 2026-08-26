@@ -193,6 +193,47 @@ function browseCommandClassic(cfg) {
       cfg.maxBrowseRows)]
 }
 
+// ================= resident change watcher =================
+
+// Escapes a literal string for embedding in an inotifywait --exclude POSIX
+// extended regex: metacharacters become inert literals.
+function escapeRegex(text) {
+  return String(text || "").replace(/[.[\]{}()*+?^$|\\]/g, "\\$&")
+}
+
+// One --exclude extended regex mirroring the scan policy, so churn inside
+// never-indexed trees cannot dirty the index. Names match at any depth;
+// ignored dirs anchor at their absolute path; without show_hidden, hidden
+// components are skipped exactly like an un--hidden fd walk would.
+function watchExcludeRegex(cfg) {
+  var parts = []
+  var names = cfg && cfg.ignoreNames ? cfg.ignoreNames : []
+  for (var i = 0; i < names.length; i++) {
+    if (names[i]) parts.push("/" + escapeRegex(names[i]) + "/")
+  }
+  var dirs = cfg && cfg.ignoredDirs ? cfg.ignoredDirs : []
+  for (i = 0; i < dirs.length; i++) {
+    if (dirs[i]) parts.push("^" + escapeRegex(dirs[i]) + "(/|$)")
+  }
+  if (cfg && !cfg.showHidden) parts.push("(^|/)\\.")
+  return parts.join("|")
+}
+
+// Resident recursive watcher over every live root. Deliberately plain argv —
+// no bash wrapper, nothing to quote, nothing to inject. Default output keeps
+// real newlines (this build does not expand "\n" escapes in --format), and
+// Finder.qml treats every line as one event. Returns null with no live roots
+// so the caller keeps its existing lifecycle rather than spawning an eternal
+// no-op.
+function buildWatchCommand(cfg) {
+  if (!cfg || !cfg.searchDirs || cfg.searchDirs.length === 0) return null
+  var args = ["inotifywait", "-m", "-r", "-q",
+    "-e", "create,delete,moved_to,moved_from,close_write"]
+  var ex = watchExcludeRegex(cfg)
+  if (ex) args.push("--exclude", ex)
+  return args.concat(cfg.searchDirs.slice())
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     scanRootsMarker: scanRootsMarker,
@@ -209,6 +250,9 @@ if (typeof module !== "undefined") {
     scanCommand: scanCommand,
     scanCommandClassic: scanCommandClassic,
     browseCommand: browseCommand,
-    browseCommandClassic: browseCommandClassic
+    browseCommandClassic: browseCommandClassic,
+    escapeRegex: escapeRegex,
+    watchExcludeRegex: watchExcludeRegex,
+    buildWatchCommand: buildWatchCommand
   }
 }

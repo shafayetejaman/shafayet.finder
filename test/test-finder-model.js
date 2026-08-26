@@ -244,6 +244,45 @@ ok(b.indexOf("@@DIRS@@") !== -1, "dirs-first classify snippet present")
 ok(b.indexOf("'--color=never'") !== -1, "browse forces color off")
 ok(b.indexOf("| head -n 200") !== -1, "browse capped by head")
 
+// ================= resident change watcher =================
+
+eq(M.escapeRegex("a.b*c"), "a\\.b\\*c", "escapeRegex neutralizes metacharacters")
+eq(M.escapeRegex("/home/u/.cache"), "/home/u/\\.cache", "escapeRegex keeps slashes, escapes dots")
+
+var watchCfg = M.resolveSettings({
+  search_dirs: ["/data", "/mnt/x"],
+  ignored_dirs: ["/data/.cache"],
+}, HOME)
+var wc = M.buildWatchCommand(watchCfg)
+ok(Array.isArray(wc) && wc[0] === "inotifywait" && wc[1] === "-m" && wc[2] === "-r",
+  "watch command is plain argv with monitor+recursive")
+ok(wc.indexOf("-q") !== -1, "watch command is quiet on stderr chatter")
+ok(wc.indexOf("-e") !== -1 && wc[wc.indexOf("-e") + 1].indexOf("create") !== -1
+   && wc[wc.indexOf("-e") + 1].indexOf("close_write") !== -1,
+  "watch event mask covers create/delete/moves/close_write")
+var exIdx = wc.indexOf("--exclude")
+ok(exIdx !== -1, "watch carries an exclude regex")
+var ex = wc[exIdx + 1]
+ok(ex.indexOf("node_modules") !== -1 && ex.indexOf("__pycache__") !== -1,
+  "builtin ignore names mirrored into the exclude regex")
+ok(ex.indexOf("\\.cache") === -1 || ex.indexOf("^/data/\\.cache") !== -1,
+  "ignored dirs anchored by absolute path")
+ok(ex.indexOf("(^|/)\\.") !== -1, "hidden components excluded when show_hidden off")
+ok(wc[wc.length - 2] === "/data" && wc[wc.length - 1] === "/mnt/x",
+  "roots are trailing positionals")
+
+// Hidden mirroring follows show_hidden.
+wc = M.buildWatchCommand(M.resolveSettings({ search_dirs: ["/data"], show_hidden: true }, HOME))
+ok(wc[wc.indexOf("--exclude") + 1].indexOf("(^|/)\\.") === -1,
+  "show_hidden drops the hidden-component exclusion")
+eq(M.buildWatchCommand({ searchDirs: [] }), null, "no roots -> no watcher")
+
+// event_scan setting resolution
+eq(M.resolveSettings({}, HOME).eventScan, "auto", "event_scan defaults to auto")
+eq(M.resolveSettings({ event_scan: true }, HOME).eventScan, true, "event_scan true passes through")
+eq(M.resolveSettings({ event_scan: false }, HOME).eventScan, false, "event_scan false disables")
+eq(M.resolveSettings({ event_scan: "yes" }, HOME).eventScan, "auto", "garbage event_scan falls back to auto")
+
 // ================= markDirectories =================
 
 eq(M.markDirectories([

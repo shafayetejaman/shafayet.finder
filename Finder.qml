@@ -90,6 +90,47 @@ Item {
   property var previewFailKeys: []
   property string prewarmKey: ""
 
+  // Event-driven invalidation: the resident watcher only flips indexDirty;
+  // the actual walk stays lazy behind open()/startup timers. watchAvailable
+  // is the inotifywait probe; watchGaveUp ends crash/watch-limit fallbacks
+  // for the session, dropping back to pure interval scanning.
+  property bool indexDirty: false
+  property bool watchAvailable: false
+  property bool watchGaveUp: false
+
+  function watcherEnabled() {
+    return root.watchAvailable && !root.watchGaveUp && root.cfg.eventScan !== false
+  }
+
+  function startWatcherIfEnabled() {
+    if (!root.watcherEnabled()) return
+    var cmd = Walks.buildWatchCommand(root.cfg)
+    if (!cmd) return
+    watchProc.deliberateStop = false
+    watchProc.command = cmd
+    watchProc.running = true
+  }
+
+  function stopWatcher() {
+    if (!watchProc.running) return
+    watchProc.deliberateStop = true
+    watchProc.running = false
+  }
+
+  // Config changes (roots, excludes, event_scan, fd override) rebuild the
+  // watch spec from scratch; failures reset so a fresh config gets fresh odds.
+  function restartWatcher() {
+    root.stopWatcher()
+    watchProc.failures = 0
+    root.startWatcherIfEnabled()
+  }
+
+  // One line per kernel event; the quiet-window timer does the coalescing.
+  function markWatchDirty() {
+    if (!root.watcherEnabled()) return
+    watchDirtyDebounce.restart()
+  }
+
   property color background: Color.menu.background
   property color foreground: Color.menu.text
   property color border: Color.menu.border
@@ -131,6 +172,7 @@ Item {
     root.ensurePool()
     root.previewFailCache = {}
     root.previewFailKeys = []
+    root.restartWatcher()
   }
 
   function open(payloadJson) {
@@ -181,7 +223,10 @@ Item {
   function refreshScan() {
     // An in-flight scan lands on its own; restarting discards fresh work.
     if (scanProc.running || root.scanQueued) return
-    if (root.lastScanFinishedAt
+    // A watcher-raised dirty flag outranks the cadence gate — but never the
+    // in-flight guard above nor the startup grace below, whose whole job is
+    // refusing to persist a truncated early walk.
+    if (!root.indexDirty && root.lastScanFinishedAt
         && Date.now() - root.lastScanFinishedAt < root.cfg.rescanIntervalMs) return
     // Startup grace: serve the disk cache until one interval elapses
     // (rescan_interval_ms 0 never blocks) — an early open must not scan-and-
@@ -225,6 +270,9 @@ Item {
     }
     root.scanRefusals = 0
     partialScanRetry.stop()
+    // Only a full accepted walk proves the dirty flag satisfied; refused
+    // retries keep it set so the next eligible refreshScan still runs.
+    root.indexDirty = false
     root.fileListCount = Core.countPaths(text)
     root.lastScanFinishedAt = Date.now()
     root.scanning = false
@@ -790,6 +838,8 @@ Item {
     // No startup scan here: listFile's load handlers pick between an
     // immediate first-run walk and the deferred startupScanTimer refresh.
     trashProbeProc.running = true
+    // Probe gates the resident watcher; its onExited calls startWatcherIfEnabled.
+    watchProbeProc.running = true
     warmRowProc.command = ["bash", "-c",
       "( " + Walks.browseCommand(root.cfg)[2] + " ) 2>/dev/null | head -n 4"]
     warmRowProc.running = true
@@ -910,6 +960,60 @@ Item {
     id: startupScanTimer
     interval: root.cfg.rescanIntervalMs
     onTriggered: root.refreshScan()
+  }
+
+  // Quiet window after the last watcher event before the index is declared
+  // dirty: a git checkout or npm install can emit thousands of events, and
+  // only silence means the churn has settled.
+  Timer {
+    id: watchDirtyDebounce
+    interval: 2000
+    onTriggered: {
+      root.indexDirty = true
+      if (root.opened) root.refreshScan()
+    }
+  }
+
+  // Crash recovery for the resident watcher: bounded retries with cooldown,
+  // then this session falls back to interval scanning via watchGaveUp.
+  Timer {
+    id: watchRetryTimer
+    interval: 5000
+    onTriggered: root.startWatcherIfEnabled()
+  }
+
+  Process {
+    id: watchProbeProc
+    command: ["bash", "-c", "command -v inotifywait >/dev/null 2>&1"]
+    onExited: {
+      root.watchAvailable = exitCode === 0
+      root.startWatcherIfEnabled()
+    }
+  }
+
+  // Resident filesystem watcher — the one process close() must never kill:
+  // its entire value is watching while the finder is closed. Events stream
+  // line-by-line through SplitParser; stderr is kept for watch-limit
+  // detection at exit ("upper limit on inotify watches").
+  Process {
+    id: watchProc
+    property bool deliberateStop: false
+    property int failures: 0
+    stdout: SplitParser {
+      onRead: root.markWatchDirty()
+    }
+    stderr: StdioCollector {}
+    onExited: {
+      if (watchProc.deliberateStop) return
+      var limitHit = String(watchProc.stderr.text || "")
+        .indexOf("upper limit on inotify watches") !== -1
+      if (limitHit || watchProc.failures >= 3) {
+        root.watchGaveUp = true
+        return
+      }
+      watchProc.failures++
+      watchRetryTimer.restart()
+    }
   }
 
   Process {
