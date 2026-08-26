@@ -3,9 +3,13 @@
 Quick Fuzzy file finder overlay for the Omarchy shell with live previews: text
 heads, directory listings, images, PDF first pages, and video frame grabs.
 
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/8c5db8a4-c0ad-4921-a1db-7de8608835be" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/5eb906ba-39a4-4371-a7b7-6e889ff32128" />
 
-https://github.com/user-attachments/assets/c07ae865-26f7-41d2-b890-42eb8456685f
+
+
+https://github.com/user-attachments/assets/5d73431c-67d4-43da-8133-672183f837f5
+
+
 
 ## Install
 
