@@ -57,11 +57,16 @@ results in memory. Typing fd flags (e.g. `--size +5mb`) on a non-All tab is
 not allowed and shows **Invalid!** in the status bar. While a walk is in
 progress the status bar shows **searching…**.
 
+Typing `/` as the first character switches to the **Folder** tab immediately
+and strips the prefix, so `/Documents` searches for folders matching
+"Documents". On the Folder tab `/` is treated as normal search text.
+
 | Key                     | Action                   |
 | ----------------------- | ------------------------ |
 | any printable character | Type to filter           |
 | `Tab` / `Shift+Tab`     | Next / previous tab      |
 | `Ctrl+L` / `Ctrl+H`     | Next / previous tab      |
+| `/` (first char)         | Switch to Folder tab     |
 | `Esc`                   | Clear filter, then close |
 | `Ctrl+Backspace`        | Delete last query word   |
 | `Up` / `Down`           | Move selection           |

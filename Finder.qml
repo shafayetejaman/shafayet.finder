@@ -52,7 +52,10 @@ Item {
   readonly property int fdWarmCacheCap: Math.max(root.cfg.maxDisplayRows, 2000)
   // Paths deleted this session; filtered out of every result producer so a
   // trashed file never resurfaces before the next index rescan.
+  // Bounded LRU: oldest entries evict when the cap is reached instead of
+  // clearing the whole set, which would re-surface deleted files.
   property var trashedPaths: ({})
+  property var trashedOrder: []
   // One-shot startup probe; Delete-to-trash degrades to an honest hint when
   // trash-cli is absent instead of silently pretending the row was trashed.
   property bool trashAvailable: false
@@ -584,6 +587,12 @@ Item {
   }
 
   function setFilter(nextFilter) {
+    // "/" prefix is a shortcut to switch to the folder tab
+    if (nextFilter.length > 0 && nextFilter.charAt(0) === "/" && root.activeTab !== "folder") {
+      root.setActiveTab("folder")
+      root.setFilter(nextFilter.substring(1))
+      return
+    }
     root.filterText = nextFilter
     root.selectedIndex = 0
     root.cursorActive = true
@@ -723,6 +732,11 @@ Item {
     }
     Util.execDetached("trash-put " + Util.shellQuote(Core.cleanPath(row.path)))
     root.trashedPaths[row.path] = true
+    root.trashedOrder.push(row.path)
+    if (root.trashedOrder.length > 1000) {
+      var old = root.trashedOrder.shift()
+      delete root.trashedPaths[old]
+    }
     // Stay open: drop the trashed row and let the selection fall on the next
     // entry, so several files can be removed in one pass.
     var remaining = []
@@ -736,22 +750,27 @@ Item {
 
   function cachedPreview(path) {
     var hit = root.previewCache[path] || null
-    if (hit) root.lruTouch(root.previewCacheKeys, path)
+    if (hit) root.lruTouch(root.previewCache, root.previewCacheKeys, path)
     return hit
   }
 
   function cachedPdf(path) {
     var hit = root.pdfCache[path] || null
-    if (hit) root.lruTouch(root.pdfCacheKeys, path)
+    if (hit) root.lruTouch(root.pdfCache, root.pdfCacheKeys, path)
     return hit
   }
 
   // Moves a key to the tail on hit so eviction follows real recency.
-  function lruTouch(keys, path) {
+  // Reassigns the array so QML property bindings detect the change.
+  function lruTouch(cache, keys, path) {
     var idx = keys.indexOf(path)
     if (idx < 0 || idx === keys.length - 1) return
     keys.splice(idx, 1)
     keys.push(path)
+    if (keys === root.previewCacheKeys) root.previewCacheKeys = keys.slice()
+    else if (keys === root.pdfCacheKeys) root.pdfCacheKeys = keys.slice()
+    else if (keys === root.imageMetaKeys) root.imageMetaKeys = keys.slice()
+    else if (keys === root.previewFailKeys) root.previewFailKeys = keys.slice()
   }
 
   function storePreviewInCache(path, meta, content) {
@@ -788,7 +807,7 @@ Item {
   function recentlyFailedPreview(path) {
     var at = root.previewFailCache[path]
     if (!at || !Preview.isFailureFresh(at, Date.now(), root.previewFailureTtlMs)) return false
-    root.lruTouch(root.previewFailKeys, path)
+    root.lruTouch(root.previewFailCache, root.previewFailKeys, path)
     return true
   }
 
@@ -893,6 +912,9 @@ Item {
   Component.onCompleted: {
     ensurePool()
     chmodIndexProc.running = true
+    // Harden the state directory so newly created index files inherit 700
+    // instead of the user's default umask (often 022).
+    chmodStateDirProc.running = true
     // No startup scan here: listFile's load handlers pick between an
     // immediate first-run walk and the deferred startupScanTimer refresh.
     trashProbeProc.running = true
@@ -947,7 +969,13 @@ Item {
 
   Process {
     id: chmodIndexProc
-    command: ["chmod", "600", root.listPath]
+    command: ["bash", "-c",
+      "umask 077; [ -f " + Core.shellQuote(root.listPath) + " ] && chmod 600 " + Core.shellQuote(root.listPath)]
+  }
+
+  Process {
+    id: chmodStateDirProc
+    command: ["bash", "-c", "chmod 700 -- " + Core.shellQuote(root.stateBase) + " 2>/dev/null || true"]
   }
 
   Process {

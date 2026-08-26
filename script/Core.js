@@ -149,7 +149,7 @@ function countPaths(raw) {
   var count = 0
   var start = 0
   var len = text.length
-  while (start <= len) {
+  while (start < len) {
     var nl = text.indexOf("\n", start)
     var end = nl === -1 ? len : nl
     if (end - start > 1 && text.charCodeAt(start) === 47) count++
@@ -163,11 +163,12 @@ function formatBytes(bytes) {
   var n = Number(bytes)
   if (!isFinite(n) || n < 0) return "? B"
   if (n < 1024) return n + " B"
-  var units = ["KB", "MB", "GB", "TB"]
+  var units = ["KB", "MB", "GB", "TB", "PB"]
   var value = n
+  var decimals = n < 10240 ? 1 : 0
   for (var i = 0; i < units.length; i++) {
     value = value / 1024
-    if (value < 1024 || i === units.length - 1) return value.toFixed(value < 10 ? 1 : 0) + " " + units[i]
+    if (value < 1024 || i === units.length - 1) return value.toFixed(decimals) + " " + units[i]
   }
   return n + " B"
 }

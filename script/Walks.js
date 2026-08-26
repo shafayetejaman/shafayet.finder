@@ -48,7 +48,7 @@ function guardedRootsSnippet(searchDirs, reportRatio) {
   var parts = ["__p=()"]
   for (var i = 0; i < searchDirs.length; i++) {
     var quoted = Core.shellQuote(searchDirs[i])
-    parts.push("[ -d " + quoted + " ] && __p+=(" + quoted + ")")
+    parts.push("[ -d " + quoted + " ] 2>/dev/null && __p+=(" + quoted + ")")
   }
   // Only index-writing scans report: flag-mode walks never touch the index,
   // and their stderr would otherwise leak the ratio to the user's terminal.

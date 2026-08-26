@@ -156,8 +156,8 @@ var classic = M.resolveSettings({
 var s = M.scanCommand(classic)[2]
 
 ok(s.indexOf("__p=() ;") === 0, "classic scan starts with guarded roots prologue")
-ok(s.indexOf("[ -d '/r1' ] && __p+=('/r1')") !== -1, "root 1 guarded")
-ok(s.indexOf("[ -d '/r2' ] && __p+=('/r2')") !== -1, "root 2 guarded")
+ok(s.indexOf("[ -d '/r1' ] 2>/dev/null && __p+=('/r1')") !== -1, "root 1 guarded")
+ok(s.indexOf("[ -d '/r2' ] 2>/dev/null && __p+=('/r2')") !== -1, "root 2 guarded")
 ok(s.indexOf('[ ${#__p[@]} -gt 0 ] || exit 0') !== -1, "all-dead roots exit cleanly")
 ok(s.indexOf('"${#__p[@]}" \'2\' >&2') !== -1, "live/total root ratio reported on stderr")
 ok(s.indexOf("'FINDER_ROOTS='") < s.indexOf("( { "), "ratio reported before the walk starts")

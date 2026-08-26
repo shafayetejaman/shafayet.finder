@@ -128,10 +128,11 @@ function fdFlagSegment(flags) {
 // would be unusable.
 function fdOverrideArgs(flags) {
   var args = Array.isArray(flags) ? flags.slice() : []
+  var found = false
   for (var i = 0; i < args.length; i++) {
-    if (args[i] === "--absolute-path" || args[i] === "-a") break
+    if (args[i] === "--absolute-path" || args[i] === "-a") { found = true; break }
   }
-  if (i === args.length) args.push("--absolute-path")
+  if (!found) args.push("--absolute-path")
   if (!hasColorFlag(args)) args.push("--color=never")
   return args
 }

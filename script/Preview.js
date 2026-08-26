@@ -24,7 +24,7 @@ var previewFailureLimit = 32
 // Wire: "\t<size>\t<mtime>\n" followed by content. Size -1 marks an
 // unreadable or vanished file without a second round trip.
 function buildPreviewCommand(path, byteLimit) {
-  if (byteLimit === undefined) byteLimit = 65536
+  byteLimit = Math.max(0, parseInt(byteLimit, 10) || 65536)
   var quoted = Core.shellQuote(path)
   return [
     "bash", "-c",
@@ -40,7 +40,7 @@ function buildPreviewCommand(path, byteLimit) {
 // Wire: "\t-2\t<entry-count>\n" followed by a one-level listing where nested
 // directories keep their trailing slash. Dot entries hidden unless showHidden.
 function buildDirPreviewCommand(path, byteLimit, showHidden) {
-  if (byteLimit === undefined) byteLimit = 65536
+  byteLimit = Math.max(0, parseInt(byteLimit, 10) || 65536)
   var quoted = Core.shellQuote(path)
   var ls = "ls -1Ap --color=never -- " + quoted + " 2>/dev/null"
   if (!showHidden) ls += " | grep -v '^\\.'"
