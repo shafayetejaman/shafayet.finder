@@ -15,7 +15,9 @@ var pdfRenderScale = 800
 var previewWorkers = 3
 var debounceMs = 40
 var fdDebounceMs = 1000
-var rescanIntervalMs = 60000
+// One background walk per interval at most: scans fire on open (plus the
+// one-shot startup refresh), so this bounds bursts without any idle timer.
+var rescanIntervalMs = 300000
 // Persistent thumbnails under ~/.cache/thumbnails/<plugin>/{pdf,video}/,
 // keyed by md5("<path>|<size>|<mtime>|<inode>"). <= 0 disables persistence.
 var thumbnailCacheLimit = 500

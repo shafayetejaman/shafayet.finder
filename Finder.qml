@@ -161,7 +161,11 @@ Item {
     previewDebounce.stop()
     root.cancelPendingWork()
     root.clearPreview()
-    root.searchResults = []
+    // Browse rows stay valid across toggles so a reopen paints its content
+    // instantly from RAM while the debounced browse re-validates in the
+    // background. Query results don't survive: open() resets filterText, so
+    // keeping them would show rows matching nothing under an empty box.
+    if (root.filterText.trim() !== "") root.searchResults = []
     root.lastFdKey = ""
     root.fdBaseRows = []
     root.fdWarmCache = null

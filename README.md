@@ -123,7 +123,7 @@ aggressive values stay safe.
 | `preview_workers`       | `int`      | `3`               | Concurrent preview processes, clamped to `1`–`3`.                                  |
 | `debounce_ms`           | `int`      | `40`              | Delay from keystroke/selection to its search/preview launch.                       |
 | `fd_debounce_ms`        | `int`      | `1000`            | Debounce for flag-mode queries, which walk real directory trees.                   |
-| `rescan_interval_ms`    | `int`      | `60000`           | Minimum time between full rescans; `0` rescans on every open.                      |
+| `rescan_interval_ms`    | `int`      | `300000`          | Minimum time between full rescans; `0` rescans on every open.                      |
 | `pdf_render_scale`      | `int`      | `800`             | `-scale-to` for page thumbnails; also caps video frame width. Clamped `64`–`4000`. |
 | `show_hidden`           | `bool`     | `false`           | Include dot files in scans and directory previews.                                 |
 | `fd_flags`              | `string[]` | _(unset)_         | **Full override** of the flags given to every `fd` call — see below.               |

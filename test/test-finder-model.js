@@ -81,6 +81,9 @@ eq(M.resolveSettings({}, HOME).thumbnailCacheLimit, M.thumbnailCacheLimit, "defa
 eq(M.resolveSettings({ thumbnail_cache_limit: 0 }, HOME).thumbnailCacheLimit, 0, "zero opts out of thumbnail persistence")
 eq(M.resolveSettings({ thumbnail_cache_limit: -5 }, HOME).thumbnailCacheLimit, M.thumbnailCacheLimit, "negative cap falls back to default")
 eq(M.resolveSettings({ thumbnail_cache_limit: "abc" }, HOME).thumbnailCacheLimit, M.thumbnailCacheLimit, "garbage thumbnail cap falls back")
+eq(M.resolveSettings({}, HOME).rescanIntervalMs, 300000, "default rescan interval is five minutes")
+eq(M.resolveSettings({ rescan_interval_ms: 0 }, HOME).rescanIntervalMs, 0, "zero rescan interval allowed (scan every open)")
+eq(M.resolveSettings({ rescan_interval_ms: -5 }, HOME).rescanIntervalMs, M.rescanIntervalMs, "negative rescan interval falls back")
 
 // ================= overlapping root pruning =================
 
