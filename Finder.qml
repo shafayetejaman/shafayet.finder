@@ -232,7 +232,7 @@ Item {
     root.setActiveTab(tabs[idx])
   }
 
-  function setActiveTab(tab) {
+  function setActiveTab(tab, deferSearch) {
     if (tab === root.activeTab) return
     root.activeTab = tab
     root.filterText = ""
@@ -247,6 +247,9 @@ Item {
     fdDebounce.stop()
     browseDebounce.stop()
     if (!root.opened) return
+    // Deferred: the caller (setFilter's "/" prefix) drives the search itself
+    // so the just-started walk is never canceled by the recursive setFilter.
+    if (deferSearch) return
     // Non-all tabs need the recursive fd walk even with empty query;
     // only the "all" tab uses the depth-limited browse.
     if (tab === "all") {
@@ -589,7 +592,9 @@ Item {
   function setFilter(nextFilter) {
     // "/" prefix is a shortcut to switch to the folder tab
     if (nextFilter.length > 0 && nextFilter.charAt(0) === "/" && root.activeTab !== "folder") {
-      root.setActiveTab("folder")
+      // Defer the search: setFilter below applies the trailing text in one pass
+      // instead of setActiveTab starting a walk that this recursion would cancel.
+      root.setActiveTab("folder", true)
       root.setFilter(nextFilter.substring(1))
       return
     }
@@ -1432,6 +1437,9 @@ Item {
             event.accepted = true
           } else if (event.key === Qt.Key_H && (event.modifiers & Qt.ControlModifier)) {
             root.cycleTab(-1)
+            event.accepted = true
+          } else if (event.text === "/" && !root.filterText && root.activeTab !== "folder") {
+            root.setActiveTab("folder")
             event.accepted = true
           } else if (Util.editsFilter(event, root.filterText)) {
             root.setFilter(Util.editedFilter(event, root.filterText))
