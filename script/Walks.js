@@ -174,6 +174,7 @@ function browseCommand(cfg, tabArgs, sortMode) {
     var ex = quotedExcludeSegment(cfg.browseDir, cfg)
     var fdCmd = "fd " + argStr + (ex ? " " + ex : "") + " --min-depth 1 --max-depth 1 . " + quoted
     if (sortMode) {
+      fdCmd = fdCmd.replace(/^fd /, "fd -0 ")
       fdCmd += " 2>/dev/null " + FdQuery.sortPipeSnippet(sortMode)
       return ["bash", "-c",
         "{ [ -d " + quoted + " ] || exit 0 ; } ; "
@@ -211,6 +212,7 @@ function browseCommandClassic(cfg, tabArgs, sortMode) {
   }
   var fdCmd = "fd " + flags + "--absolute-path --min-depth 1 --max-depth 1 . " + quoted + " 2>/dev/null"
   if (sortMode) {
+    fdCmd = fdCmd.replace(/^fd /, "fd -0 ")
     fdCmd += " " + FdQuery.sortPipeSnippet(sortMode)
     return ["bash", "-c",
       "{ [ -d " + quoted + " ] || exit 0 ; } ; "

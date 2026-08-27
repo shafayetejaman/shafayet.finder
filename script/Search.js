@@ -73,6 +73,7 @@ function liveFdCommand(cfg, parsed, cap) {
   var fdCmd = "fd " + argStr + (ex ? " " + ex : "")
     + " " + Core.shellQuote(parsed.fdPattern || ".") + " \"${__p[@]}\" 2>/dev/null"
   if (parsed.sortMode) {
+    fdCmd = fdCmd.replace(/^fd /, "fd -0 ")
     fdCmd += " " + FdQuery.sortPipeSnippet(parsed.sortMode)
   }
   return ["bash", "-c",

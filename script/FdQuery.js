@@ -41,7 +41,7 @@ function tabArgs(tab) {
 // xargs -P 8 parallelizes stat calls for faster sort on large result sets.
 function sortPipeSnippet(sortMode) {
   var field = sortMode === "birth" ? "%W" : "%Y"
-  return "| xargs -I {} -P 8 sh -c "
+  return "| xargs -0 -I {} -P 8 sh -c "
     + "'printf \"%s\\t%s\\n\" \"$(stat -c '" + field + "' -- \"{}\" 2>/dev/null || echo 0)\" \"{}\"'"
     + " | sort -t'	' -rn | cut -f2-"
 }
