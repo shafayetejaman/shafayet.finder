@@ -1423,6 +1423,15 @@ Item {
             else root.close()
             event.accepted = true
           } else if ((event.modifiers & Qt.ControlModifier)
+                     && (event.key === Qt.Key_H
+                         || (event.key === Qt.Key_Backspace && event.text && event.text.charCodeAt(0) === 8))) {
+            // Ctrl+H cycles to the previous tab. Qt reports it as
+            // Key_Backspace carrying the BS (0x08) control char rather than
+            // Key_H, so match both — and before the Ctrl+Backspace word-delete
+            // branch, which would otherwise swallow it.
+            root.cycleTab(-1)
+            event.accepted = true
+          } else if ((event.modifiers & Qt.ControlModifier)
                      && (event.key === Qt.Key_Backspace || event.key === Qt.Key_Delete
                          || (event.text && (event.text.charCodeAt(0) === 8 || event.text.charCodeAt(0) === 127)))) {
             // Ctrl+Backspace deletes the last filter word. The key is reported
@@ -1439,9 +1448,6 @@ Item {
             event.accepted = true
           } else if (event.key === Qt.Key_L && (event.modifiers & Qt.ControlModifier)) {
             root.cycleTab(1)
-            event.accepted = true
-          } else if (event.key === Qt.Key_H && (event.modifiers & Qt.ControlModifier)) {
-            root.cycleTab(-1)
             event.accepted = true
           } else if (event.text === "/" && !root.filterText && root.activeTab !== "folder") {
             root.setActiveTab("folder")
