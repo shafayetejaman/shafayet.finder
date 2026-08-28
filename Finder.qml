@@ -1422,8 +1422,13 @@ Item {
             if (root.filterText) root.setFilter("")
             else root.close()
             event.accepted = true
-          } else if (event.key === Qt.Key_Backspace && (event.modifiers & Qt.ControlModifier)) {
-            // Must run before Util.editsFilter or plain backspace eats Ctrl.
+          } else if ((event.modifiers & Qt.ControlModifier)
+                     && (event.key === Qt.Key_Backspace || event.key === Qt.Key_Delete
+                         || (event.text && (event.text.charCodeAt(0) === 8 || event.text.charCodeAt(0) === 127)))) {
+            // Ctrl+Backspace deletes the last filter word. The key is reported
+            // as Key_Backspace, Key_Delete, or a DEL(127)/BS(8) text event
+            // depending on input-method state, so match all three. Must run
+            // before Util.editsFilter and the Delete/Ctrl+D (trash) branch.
             root.setFilter(Core.deleteLastWord(root.filterText))
             event.accepted = true
           } else if (event.key === Qt.Key_Tab) {
@@ -1474,7 +1479,8 @@ Item {
             else if (root.cursorActive) root.activateIndex(root.selectedIndex)
             else if (displayModel.count > 0) root.cursorActive = true
             event.accepted = true
-          } else if (event.key === Qt.Key_Delete || (event.key === Qt.Key_D && (event.modifiers & Qt.ControlModifier))) {
+          } else if ((event.key === Qt.Key_Delete && !(event.modifiers & Qt.ControlModifier))
+                     || (event.key === Qt.Key_D && (event.modifiers & Qt.ControlModifier))) {
             root.trashIndex(root.selectedIndex)
             event.accepted = true
           } else if (event.text && event.text.length === 1 && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127) {
