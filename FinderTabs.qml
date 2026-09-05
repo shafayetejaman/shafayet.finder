@@ -18,6 +18,7 @@ Row {
     "document": "Doc",
     "image": "Image",
     "music": "Music",
+    "video": "Video",
     "pdf": "PDF",
     "modified": "Modified",
     "created": "Created"
@@ -26,7 +27,7 @@ Row {
   spacing: Style.space(4) + 2
 
   Repeater {
-    model: ["all", "folder", "document", "image", "music", "pdf", "modified", "created"]
+    model: ["all", "folder", "document", "image", "music", "video", "pdf", "modified", "created"]
 
     Rectangle {
       id: chip

@@ -1067,8 +1067,8 @@ ok(!M.isFailureFresh(NaN, 5000, M.previewFailureTtlMs), "garbage timestamp never
 
 // ================= tabArgs =================
 
-eq(M.TAB_LIST, ["all", "folder", "document", "image", "music", "pdf", "modified", "created"],
-  "TAB_LIST has all eight tabs in order")
+eq(M.TAB_LIST, ["all", "folder", "document", "image", "music", "video", "pdf", "modified", "created"],
+  "TAB_LIST has all nine tabs in order")
 eq(M.tabArgs("all"), { args: [], sort: null }, "all tab → no flags")
 eq(M.tabArgs("folder"), { args: ["--type", "directory"], sort: null }, "folder tab → --type directory")
 eq(M.tabArgs("pdf"), { args: ["-e", "pdf"], sort: null }, "pdf tab → single extension")
@@ -1092,6 +1092,12 @@ ok(imgArgs.indexOf("webp") !== -1, "image tab includes webp")
 var musArgs = M.tabArgs("music").args
 ok(musArgs.indexOf("mp3") !== -1, "music tab includes mp3")
 ok(musArgs.indexOf("flac") !== -1, "music tab includes flac")
+
+var vidArgs = M.tabArgs("video").args
+ok(vidArgs.indexOf("mp4") !== -1, "video tab includes mp4")
+ok(vidArgs.indexOf("mkv") !== -1, "video tab includes mkv")
+ok(vidArgs.indexOf("webm") !== -1, "video tab includes webm")
+ok(vidArgs.length % 2 === 0, "video tab args come in flag-value pairs")
 
 // ================= sortPipeSnippet =================
 
@@ -1119,6 +1125,9 @@ eq(M.effectiveQuery("invoice", "folder"),
 eq(M.effectiveQuery("report", "pdf"),
   { args: ["-e", "pdf"], fdPattern: ".", fzfQuery: "report", sortMode: null },
   "plain text on pdf tab → extension + fzf staging")
+eq(M.effectiveQuery("clip", "video"),
+  { args: M.tabArgs("video").args, fdPattern: ".", fzfQuery: "clip", sortMode: null },
+  "plain text on video tab → extension walk + fzf staging")
 eq(M.effectiveQuery("", "modified"),
   { args: [], fdPattern: ".", fzfQuery: "", sortMode: "mtime" },
   "empty text on modified tab → mtime sort, match-all")

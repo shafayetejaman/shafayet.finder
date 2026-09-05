@@ -4,7 +4,7 @@
 .import "Core.js" as Core
 
 // Ordered tab ids for the UI chip row.  "all" is the default (no flags).
-var TAB_LIST = ["all", "folder", "document", "image", "music", "pdf", "modified", "created"]
+var TAB_LIST = ["all", "folder", "document", "image", "music", "video", "pdf", "modified", "created"]
 
 // Per-tab fd args and optional stat-sort mode.  Extension tabs emit repeated
 // -e pairs; sort tabs return an empty args array plus a mode string that the
@@ -24,6 +24,10 @@ function tabArgs(tab) {
   case "music":
     return { args: ["-e", "mp3", "-e", "flac", "-e", "wav", "-e", "ogg", "-e", "opus",
                      "-e", "m4a", "-e", "aac", "-e", "wma"], sort: null }
+  case "video":
+    return { args: ["-e", "mp4", "-e", "mkv", "-e", "webm", "-e", "mov", "-e", "avi",
+                     "-e", "m4v", "-e", "mpg", "-e", "mpeg", "-e", "wmv", "-e", "flv",
+                     "-e", "m2ts", "-e", "ts", "-e", "3gp", "-e", "ogv"], sort: null }
   case "pdf":
     return { args: ["-e", "pdf"], sort: null }
   case "modified":

@@ -50,8 +50,8 @@ Open the finder from your configured launcher binding and start typing. With
 an empty query it browses a start directory instead of searching.
 
 A chip row below the search box shows filter tabs: **All** (classic), **Folder**,
-**Doc**, **Image**, **Music**, **PDF**, **Modified** (newest first), **Created**
-(newest first). Switching tabs clears the input. Non-All tabs use a recursive
+**Doc**, **Image**, **Music**, **Video**, **PDF**, **Modified** (newest first),
+**Created** (newest first). Switching tabs clears the input. Non-All tabs use a recursive
 `fd` walk with injected type/extension flags; typed text fuzzy-filters the
 results in memory. Typing fd flags (e.g. `--size +5mb`) on a non-All tab is
 not allowed and shows **Invalid!** in the status bar. While a walk is in
